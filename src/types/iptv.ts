@@ -14,7 +14,11 @@ export interface Channel {
   status?: 'active' | 'check' | 'offline';
   description?: string;
   updated_at?: string;
+  created_at?: string;
+  view_count?: number;
 }
+
+export type ChannelSortOption = 'default' | 'popular' | 'recent' | 'name';
 
 export interface Playlist {
   id: string;

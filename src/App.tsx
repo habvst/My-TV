@@ -1,12 +1,13 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { Channel, DeviceInfo } from './types/iptv';
+import { Channel, DeviceInfo, ChannelSortOption } from './types/iptv';
 import { VideoPlayer } from './components/VideoPlayer';
-import { ChannelCard } from './components/ChannelCard';
+import { ChannelCard, ChannelCardSkeleton } from './components/ChannelCard';
 import { ChannelDetailsModal } from './components/ChannelDetailsModal';
 import { NokiaSimulatorModal } from './components/NokiaSimulatorModal';
 import { M3uImporterModal } from './components/M3uImporterModal';
 import { CategoryScrollNav } from './components/CategoryScrollNav';
 import { AdminPortal } from './components/AdminPortal';
+import { Pagination } from './components/Pagination';
 import {
   Tv,
   Search,
@@ -16,7 +17,9 @@ import {
   Shield,
   ArrowUpRight,
   RefreshCw,
-  ChevronDown
+  Flame,
+  Clock,
+  ArrowUpDown,
 } from 'lucide-react';
 
 const STORAGE_FAVORITES_KEY = 'my_iptv_favorites_v1';
@@ -27,15 +30,15 @@ export default function App() {
     return typeof window !== 'undefined' && window.location.pathname === '/admin' ? 'admin' : 'app';
   });
 
-  // Channel & Pagination state
+  // Channel & Pagination state (strict 60 channels per page limit)
   const [channels, setChannels] = useState<Channel[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
-  const [loadingMore, setLoadingMore] = useState<boolean>(false);
   const [selectedChannel, setSelectedChannel] = useState<Channel | null>(null);
   const [playTrigger, setPlayTrigger] = useState<number>(0);
   const [activeGroup, setActiveGroup] = useState<string>('all');
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [debouncedQuery, setDebouncedQuery] = useState<string>('');
+  const [sortOption, setSortOption] = useState<ChannelSortOption>('default');
   const [currentPage, setCurrentPage] = useState<number>(1);
   const [totalPages, setTotalPages] = useState<number>(1);
   const [totalMatching, setTotalMatching] = useState<number>(0);
@@ -49,6 +52,16 @@ export default function App() {
   const [favorites, setFavorites] = useState<string[]>([]);
   const [recentIds, setRecentIds] = useState<string[]>([]);
   const [deviceInfo, setDeviceInfo] = useState<DeviceInfo | null>(null);
+
+  // Stable refs to prevent loadChannels recreation when channel or favorites change
+  const favoritesRef = useRef<string[]>(favorites);
+  favoritesRef.current = favorites;
+
+  const recentIdsRef = useRef<string[]>(recentIds);
+  recentIdsRef.current = recentIds;
+
+  const selectedChannelRef = useRef<Channel | null>(selectedChannel);
+  selectedChannelRef.current = selectedChannel;
 
   // Modals
   const [detailChannel, setDetailChannel] = useState<Channel | null>(null);
@@ -115,11 +128,10 @@ export default function App() {
     fetchMetadata();
   }, [fetchMetadata]);
 
-  // Server-Side Channels Fetcher with Pagination & Filtering
+  // Server-Side Channels Fetcher with Pagination, Sorting & Filtering (Strict 60 channels per page)
   const loadChannels = useCallback(
-    async (group: string, query: string, page: number = 1, append: boolean = false) => {
-      if (page === 1) setLoading(true);
-      else setLoadingMore(true);
+    async (group: string, query: string, page: number = 1, sort: ChannelSortOption = 'default') => {
+      setLoading(true);
 
       try {
         // Special local tabs: favorites and recent
@@ -128,7 +140,7 @@ export default function App() {
           if (res.ok) {
             const data = await res.json();
             const allItems: Channel[] = data.channels || [];
-            const targetIds = group === 'favorites' ? favorites : recentIds;
+            const targetIds = group === 'favorites' ? favoritesRef.current : recentIdsRef.current;
             let filtered = allItems.filter((c) => targetIds.includes(c.id));
 
             if (query.trim()) {
@@ -141,19 +153,45 @@ export default function App() {
               );
             }
 
-            setChannels(filtered);
-            setTotalMatching(filtered.length);
-            setCurrentPage(1);
-            setTotalPages(1);
+            // Apply sorting for local tabs
+            if (sort === 'popular') {
+              filtered.sort((a, b) => {
+                const countA = a.view_count || 0;
+                const countB = b.view_count || 0;
+                if (countB !== countA) return countB - countA;
+                return a.name.localeCompare(b.name);
+              });
+            } else if (sort === 'recent') {
+              filtered.sort((a, b) => {
+                const timeA = a.updated_at || a.created_at ? new Date(a.updated_at || a.created_at || '').getTime() : 0;
+                const timeB = b.updated_at || b.created_at ? new Date(b.updated_at || b.created_at || '').getTime() : 0;
+                if (timeB !== timeA) return timeB - timeA;
+                return a.name.localeCompare(b.name);
+              });
+            } else if (sort === 'name') {
+              filtered.sort((a, b) => a.name.localeCompare(b.name));
+            }
 
-            if (filtered.length > 0 && !selectedChannel) {
-              setSelectedChannel(filtered[0]);
+            const total = filtered.length;
+            const limit = 60;
+            const computedTotalPages = Math.max(1, Math.ceil(total / limit));
+            const validPage = Math.min(Math.max(1, page), computedTotalPages);
+            const startIndex = (validPage - 1) * limit;
+            const paginated = filtered.slice(startIndex, startIndex + limit);
+
+            setChannels(paginated);
+            setTotalMatching(total);
+            setCurrentPage(validPage);
+            setTotalPages(computedTotalPages);
+
+            if (paginated.length > 0 && !selectedChannelRef.current) {
+              setSelectedChannel(paginated[0]);
             }
           }
           return;
         }
 
-        // Standard server-side filtering & search
+        // Standard server-side filtering, sorting & search (60 channels per page)
         const params = new URLSearchParams();
         params.set('page', String(page));
         params.set('limit', '60');
@@ -163,23 +201,21 @@ export default function App() {
         if (query.trim()) {
           params.set('q', query.trim());
         }
+        if (sort && sort !== 'default') {
+          params.set('sort', sort);
+        }
 
         const res = await fetch(`/api/channels?${params.toString()}`);
         if (res.ok) {
           const data = await res.json();
           const newChannels: Channel[] = data.channels || [];
 
-          if (append) {
-            setChannels((prev) => [...prev, ...newChannels]);
-          } else {
-            setChannels(newChannels);
-          }
-
+          setChannels(newChannels);
           setTotalMatching(data.total || 0);
           setCurrentPage(data.page || 1);
           setTotalPages(data.totalPages || 1);
 
-          if (!selectedChannel && newChannels.length > 0) {
+          if (!selectedChannelRef.current && newChannels.length > 0) {
             setSelectedChannel(newChannels[0]);
           }
         }
@@ -187,38 +223,53 @@ export default function App() {
         console.error('Error loading channels:', err);
       } finally {
         setLoading(false);
-        setLoadingMore(false);
       }
     },
-    [favorites, recentIds, selectedChannel]
+    [] // Stable empty dependency: no re-fetches when channel is selected or favorites modified
   );
 
-  // Trigger load when group or debounced query changes
+  // Trigger load when group, debounced query, or sortOption changes
   useEffect(() => {
-    loadChannels(activeGroup, debouncedQuery, 1, false);
-  }, [activeGroup, debouncedQuery, loadChannels]);
+    setCurrentPage(1);
+    loadChannels(activeGroup, debouncedQuery, 1, sortOption);
+  }, [activeGroup, debouncedQuery, sortOption, loadChannels]);
 
-  // Load next page
-  const handleLoadMore = () => {
-    if (currentPage < totalPages && !loadingMore) {
-      loadChannels(activeGroup, debouncedQuery, currentPage + 1, true);
+  // Handle sort change
+  const handleSortChange = (newSort: ChannelSortOption) => {
+    if (newSort === sortOption) return;
+    setSortOption(newSort);
+  };
+
+  // Handle page navigation
+  const handlePageChange = (newPage: number) => {
+    if (newPage < 1 || newPage > totalPages || newPage === currentPage || loading) return;
+    setCurrentPage(newPage);
+    loadChannels(activeGroup, debouncedQuery, newPage, sortOption);
+    // Smoothly scroll the channel list container to the top ONLY on page change
+    if (channelListRef.current) {
+      channelListRef.current.scrollTo({ top: 0, behavior: 'smooth' });
     }
   };
 
-  // Handle select & play channel
+  // Handle select & play channel - keeps list and scroll position intact
   const handleSelectChannel = (channel: Channel) => {
     setSelectedChannel(channel);
     setPlayTrigger((prev) => prev + 1);
 
-    // Scroll smoothly to player if on mobile
-    if (typeof window !== 'undefined' && window.innerWidth < 1024) {
-      window.scrollTo({ top: 0, behavior: 'smooth' });
-    }
+    // Immediately increment view count in React state for instant UI update
+    setChannels((prev) =>
+      prev.map((c) =>
+        c.id === channel.id ? { ...c, view_count: (c.view_count || 0) + 1 } : c
+      )
+    );
 
-    // Update recently watched list
+    // Record click on server
+    fetch(`/api/channels/${encodeURIComponent(channel.id)}/click`, { method: 'POST' }).catch(() => {});
+
+    // Update recently watched list without re-triggering channel list re-renders
     setRecentIds((prev) => {
       const filtered = prev.filter((id) => id !== channel.id);
-      const updated = [channel.id, ...filtered].slice(0, 12);
+      const updated = [channel.id, ...filtered].slice(0, 30);
       try {
         localStorage.setItem(STORAGE_RECENT_KEY, JSON.stringify(updated));
       } catch (e) {
@@ -270,7 +321,7 @@ export default function App() {
     window.history.pushState({}, '', '/');
     setViewMode('app');
     fetchMetadata();
-    loadChannels(activeGroup, debouncedQuery, 1, false);
+    loadChannels(activeGroup, debouncedQuery, 1);
   };
 
   // ---------------------------------------------------------------------------
@@ -510,46 +561,182 @@ export default function App() {
               recentCount={recentIds.length}
             />
 
-            {/* Active Filter Header */}
-            <div className="flex items-center justify-between text-xs px-1 text-neutral-400">
-              <span>
+            {/* Sort Controls Toolbar */}
+            <div className="flex flex-wrap items-center justify-between gap-1.5 px-2.5 py-1.5 bg-neutral-900/90 border border-neutral-800 rounded-xl">
+              <div className="flex items-center gap-1.5 flex-wrap">
+                <span className="text-[11px] font-medium text-neutral-400 flex items-center gap-1 mr-1">
+                  <ArrowUpDown className="w-3.5 h-3.5 text-neutral-400" />
+                  Sắp xếp:
+                </span>
+
+                <button
+                  type="button"
+                  onClick={() => handleSortChange('default')}
+                  className={`px-2.5 py-1 rounded-lg text-xs font-medium transition flex items-center gap-1 ${
+                    sortOption === 'default'
+                      ? 'bg-neutral-800 text-white border border-neutral-700 shadow-sm'
+                      : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800/60'
+                  }`}
+                  title="Thứ tự mặc định"
+                >
+                  Mặc định
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => handleSortChange('popular')}
+                  className={`px-2.5 py-1 rounded-lg text-xs font-medium transition flex items-center gap-1.5 ${
+                    sortOption === 'popular'
+                      ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40 shadow-sm'
+                      : 'text-neutral-400 hover:text-amber-400 hover:bg-neutral-800/60'
+                  }`}
+                  title="Sắp xếp theo số lượt xem và lượt click nhiều nhất"
+                >
+                  <Flame className={`w-3.5 h-3.5 ${sortOption === 'popular' ? 'text-amber-400' : 'text-neutral-500'}`} />
+                  <span>Phổ biến nhất</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => handleSortChange('recent')}
+                  className={`px-2.5 py-1 rounded-lg text-xs font-medium transition flex items-center gap-1.5 ${
+                    sortOption === 'recent'
+                      ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 shadow-sm'
+                      : 'text-neutral-400 hover:text-emerald-400 hover:bg-neutral-800/60'
+                  }`}
+                  title="Sắp xếp theo thời gian mới thêm hoặc cập nhật gần đây"
+                >
+                  <Clock className={`w-3.5 h-3.5 ${sortOption === 'recent' ? 'text-emerald-400' : 'text-neutral-500'}`} />
+                  <span>Mới thêm gần đây</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => handleSortChange('name')}
+                  className={`px-2 py-1 rounded-lg text-xs font-medium transition flex items-center gap-1 ${
+                    sortOption === 'name'
+                      ? 'bg-neutral-800 text-white border border-neutral-700 shadow-sm'
+                      : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800/60'
+                  }`}
+                  title="Sắp xếp theo tên kênh từ A đến Z"
+                >
+                  <span>Tên A-Z</span>
+                </button>
+              </div>
+
+              {(activeGroup !== 'all' || debouncedQuery || sortOption !== 'default') && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setActiveGroup('all');
+                    setSearchQuery('');
+                    handleSortChange('default');
+                  }}
+                  className="text-[11px] text-rose-400 hover:text-rose-300 hover:underline transition ml-auto"
+                >
+                  Đặt lại
+                </button>
+              )}
+            </div>
+
+            {/* Active Filter & Mini Paging Header */}
+            <div className="flex flex-wrap items-center justify-between text-xs px-1 text-neutral-400 gap-2">
+              <div className="flex items-center gap-1.5 flex-wrap">
                 {activeGroup !== 'all' ? (
-                  <>
-                    Đang lọc nhóm: <strong className="text-amber-400">{activeGroup}</strong>
-                  </>
+                  <span>
+                    Đang lọc nhóm: <strong className="text-amber-400 font-semibold">{activeGroup}</strong>
+                  </span>
                 ) : (
                   <span>Tất cả kênh</span>
                 )}
                 {debouncedQuery && (
-                  <>
-                    {' '}&bull; Từ khóa: <strong className="text-white">"{debouncedQuery}"</strong>
-                  </>
+                  <span>
+                    &bull; Từ khóa: <strong className="text-white">"{debouncedQuery}"</strong>
+                  </span>
                 )}
-                {' '}&bull; Tìm thấy: <strong className="text-emerald-400">{totalMatching.toLocaleString()} kênh</strong>
-              </span>
+                {sortOption === 'popular' && (
+                  <span className="text-amber-400 font-medium flex items-center gap-0.5">
+                    &bull; <Flame className="w-3 h-3 text-amber-500 inline" /> Phổ biến
+                  </span>
+                )}
+                {sortOption === 'recent' && (
+                  <span className="text-emerald-400 font-medium flex items-center gap-0.5">
+                    &bull; <Clock className="w-3 h-3 text-emerald-500 inline" /> Mới thêm
+                  </span>
+                )}
+                {sortOption === 'name' && (
+                  <span className="text-neutral-300 font-medium">
+                    &bull; A-Z
+                  </span>
+                )}
+                <span>
+                  &bull; Tìm thấy: <strong className="text-emerald-400 font-semibold">{totalMatching.toLocaleString()} kênh</strong>
+                </span>
+                {totalPages > 1 && (
+                  <span className="text-[11px] text-neutral-300 bg-neutral-900 border border-neutral-800 px-2 py-0.5 rounded-md font-mono">
+                    Trang <strong className="text-amber-400 font-bold">{currentPage}</strong> / {totalPages}
+                  </span>
+                )}
+              </div>
 
-              {(activeGroup !== 'all' || debouncedQuery) && (
-                <button
-                  onClick={() => {
-                    setActiveGroup('all');
-                    setSearchQuery('');
-                  }}
-                  className="text-[11px] text-rose-400 hover:underline"
-                >
-                  Xóa bộ lọc
-                </button>
-              )}
+              <div className="flex items-center gap-2">
+                {/* Quick mini prev/next buttons */}
+                {totalPages > 1 && (
+                  <div className="flex items-center gap-1">
+                    <button
+                      type="button"
+                      disabled={currentPage <= 1 || loading}
+                      onClick={() => handlePageChange(currentPage - 1)}
+                      className="px-2 py-0.5 rounded-md bg-neutral-900 hover:bg-neutral-800 border border-neutral-800 text-[11px] disabled:opacity-30 disabled:cursor-not-allowed transition text-neutral-300"
+                      title="Trang trước"
+                    >
+                      &larr; Trang trước
+                    </button>
+                    <button
+                      type="button"
+                      disabled={currentPage >= totalPages || loading}
+                      onClick={() => handlePageChange(currentPage + 1)}
+                      className="px-2 py-0.5 rounded-md bg-neutral-900 hover:bg-neutral-800 border border-neutral-800 text-[11px] disabled:opacity-30 disabled:cursor-not-allowed transition text-neutral-300"
+                      title="Trang sau"
+                    >
+                      Trang sau &rarr;
+                    </button>
+                  </div>
+                )}
+
+                {(activeGroup !== 'all' || debouncedQuery) && (
+                  <button
+                    onClick={() => {
+                      setActiveGroup('all');
+                      setSearchQuery('');
+                    }}
+                    className="text-[11px] text-rose-400 hover:underline ml-1"
+                  >
+                    Xóa bộ lọc
+                  </button>
+                )}
+              </div>
             </div>
 
             {/* Channels Grid / List with Custom Smooth Scrollbar */}
             <div
               ref={channelListRef}
-              className="flex-1 flex flex-col gap-2.5 overflow-y-auto max-h-[580px] pr-1.5 custom-scrollbar"
+              className="flex-1 flex flex-col gap-3 overflow-y-auto max-h-[620px] pr-1.5 custom-scrollbar"
             >
               {loading ? (
-                <div className="text-center py-16 text-neutral-500 text-xs flex flex-col items-center gap-2">
-                  <RefreshCw className="w-5 h-5 animate-spin text-amber-500" />
-                  <span>Đang tải danh sách kênh...</span>
+                <div className="flex flex-col gap-3">
+                  <div className="flex items-center justify-between px-1 py-1 text-xs text-neutral-400">
+                    <div className="flex items-center gap-2">
+                      <RefreshCw className="w-3.5 h-3.5 animate-spin text-amber-500" />
+                      <span className="text-neutral-300 font-medium">Đang tải danh sách kênh (Trang {currentPage})...</span>
+                    </div>
+                    <span className="text-[11px] text-neutral-500 font-mono">Tối đa 60 kênh/trang</span>
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-1 xl:grid-cols-2 gap-2.5">
+                    {Array.from({ length: 12 }).map((_, idx) => (
+                      <ChannelCardSkeleton key={`skeleton-${idx}`} />
+                    ))}
+                  </div>
                 </div>
               ) : channels.length === 0 ? (
                 <div className="text-center py-12 bg-neutral-900/40 rounded-xl border border-neutral-800 p-6">
@@ -584,31 +771,17 @@ export default function App() {
                     ))}
                   </div>
 
-                  {/* Load More Button when there are more pages */}
-                  {currentPage < totalPages && (
-                    <div className="pt-2 pb-4 text-center">
-                      <button
-                        type="button"
-                        onClick={handleLoadMore}
-                        disabled={loadingMore}
-                        className="w-full py-2.5 bg-neutral-900 hover:bg-neutral-850 border border-neutral-800 hover:border-amber-500/50 rounded-xl text-xs font-semibold text-neutral-200 hover:text-white transition flex items-center justify-center gap-2 shadow-sm"
-                      >
-                        {loadingMore ? (
-                          <>
-                            <RefreshCw className="w-3.5 h-3.5 animate-spin text-amber-500" />
-                            <span>Đang tải thêm kênh...</span>
-                          </>
-                        ) : (
-                          <>
-                            <ChevronDown className="w-4 h-4 text-amber-500" />
-                            <span>
-                              Tải thêm 60 kênh nữa (Đang hiển thị {channels.length.toLocaleString()} / {totalMatching.toLocaleString()} kênh)
-                            </span>
-                          </>
-                        )}
-                      </button>
-                    </div>
-                  )}
+                  {/* Standard Pagination Bar with maximum 60 channels per page */}
+                  <div className="pt-2 pb-3">
+                    <Pagination
+                      currentPage={currentPage}
+                      totalPages={totalPages}
+                      totalItems={totalMatching}
+                      itemsPerPage={60}
+                      onPageChange={handlePageChange}
+                      disabled={loading}
+                    />
+                  </div>
                 </>
               )}
             </div>

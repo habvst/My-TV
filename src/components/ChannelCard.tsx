@@ -1,6 +1,6 @@
 import React from 'react';
 import { Channel } from '../types/iptv';
-import { Play, Star, Info, ExternalLink } from 'lucide-react';
+import { Play, Star, Info, ExternalLink, Flame } from 'lucide-react';
 
 interface ChannelCardProps {
   channel: Channel;
@@ -54,13 +54,28 @@ export const ChannelCard: React.FC<ChannelCardProps> = ({
           <h3 className={`text-sm font-semibold truncate leading-tight ${isActive ? 'text-amber-400' : 'text-neutral-200'}`}>
             {channel.name}
           </h3>
-          <div className="flex items-center gap-1.5 mt-1">
+          <div className="flex items-center gap-1.5 mt-1 flex-wrap">
             <span className="text-[11px] font-medium text-amber-500/80 bg-amber-500/10 px-1.5 py-0.5 rounded">
               {channel.group}
             </span>
             <span className="text-[10px] text-neutral-400">
               {channel.resolution || 'HD'}
             </span>
+            {channel.view_count !== undefined && channel.view_count > 0 && (
+              <span
+                className="text-[10px] text-amber-400 bg-amber-500/15 border border-amber-500/25 px-1.5 py-0.5 rounded flex items-center gap-0.5 font-medium"
+                title={`${channel.view_count.toLocaleString()} lượt xem / click`}
+              >
+                <Flame className="w-2.5 h-2.5 text-amber-500" />
+                {channel.view_count.toLocaleString()}
+              </span>
+            )}
+            {isActive && (
+              <span className="text-[10px] font-bold text-emerald-400 bg-emerald-500/15 border border-emerald-500/30 px-1.5 py-0.5 rounded flex items-center gap-1 animate-pulse">
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
+                Đang phát
+              </span>
+            )}
           </div>
         </div>
 
@@ -118,6 +133,43 @@ export const ChannelCard: React.FC<ChannelCardProps> = ({
           >
             <Play className="w-3.5 h-3.5 fill-current ml-0.5" />
           </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export const ChannelCardSkeleton: React.FC = () => {
+  return (
+    <div className="relative p-3 rounded-xl border border-neutral-800/80 bg-neutral-900/60 flex flex-col justify-between overflow-hidden animate-pulse">
+      {/* Shimmer subtle gradient overlay */}
+      <div className="flex items-start gap-3">
+        {/* Logo / Thumbnail Skeleton */}
+        <div className="w-12 h-12 bg-neutral-800 rounded-lg flex-shrink-0" />
+
+        {/* Info Skeleton */}
+        <div className="flex-1 min-w-0 pr-6 space-y-2 py-0.5">
+          {/* Channel Name Line */}
+          <div className="h-4 bg-neutral-800 rounded-md w-3/4" />
+          
+          {/* Badges Line */}
+          <div className="flex items-center gap-2 pt-0.5">
+            <div className="h-3.5 bg-neutral-800/90 rounded w-16" />
+            <div className="h-3 bg-neutral-800/70 rounded w-8" />
+          </div>
+        </div>
+
+        {/* Favorite Icon Placeholder */}
+        <div className="absolute top-3 right-3 w-4 h-4 bg-neutral-800/80 rounded" />
+      </div>
+
+      {/* Bottom Bar Skeleton */}
+      <div className="mt-3 pt-2 border-t border-neutral-800/60 flex items-center justify-between">
+        <div className="h-3 bg-neutral-800/80 rounded w-10 font-mono" />
+        <div className="flex items-center gap-1.5">
+          <div className="w-5 h-5 rounded bg-neutral-800/70" />
+          <div className="w-5 h-5 rounded bg-neutral-800/70" />
+          <div className="w-7 h-7 rounded-full bg-neutral-800" />
         </div>
       </div>
     </div>

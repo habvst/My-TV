@@ -9,6 +9,21 @@ const { Pool } = pg;
 const DATA_DIR = path.resolve(process.cwd(), 'data');
 const PLAYLISTS_FILE = path.join(DATA_DIR, 'playlists.json');
 const CHANNELS_FILE = path.join(DATA_DIR, 'channels.json');
+const STATS_FILE = path.join(DATA_DIR, 'channel_stats.json');
+
+let channelClicksCache: Record<string, number> = {};
+let statsSaveTimeout: NodeJS.Timeout | null = null;
+
+function scheduleSaveStats() {
+  if (statsSaveTimeout) clearTimeout(statsSaveTimeout);
+  statsSaveTimeout = setTimeout(() => {
+    try {
+      fs.writeFileSync(STATS_FILE, JSON.stringify(channelClicksCache, null, 2), 'utf-8');
+    } catch (e) {
+      console.error('[Storage] Error writing channel_stats.json:', e);
+    }
+  }, 400);
+}
 
 // Ensure data directory exists
 if (!fs.existsSync(DATA_DIR)) {
@@ -65,8 +80,10 @@ async function initPostgresTables() {
         resolution TEXT,
         status TEXT NOT NULL DEFAULT 'active',
         description TEXT,
-        updated_at TEXT NOT NULL
+        updated_at TEXT NOT NULL,
+        view_count INT DEFAULT 0
       );
+      ALTER TABLE channels ADD COLUMN IF NOT EXISTS view_count INT DEFAULT 0;
     `);
     console.log('[Storage] PostgreSQL tables verified.');
   } catch (err) {
@@ -118,6 +135,13 @@ function loadFileState() {
     }
     if (fs.existsSync(CHANNELS_FILE)) {
       channelsCache = JSON.parse(fs.readFileSync(CHANNELS_FILE, 'utf-8'));
+    }
+    if (fs.existsSync(STATS_FILE)) {
+      try {
+        channelClicksCache = JSON.parse(fs.readFileSync(STATS_FILE, 'utf-8'));
+      } catch (e) {
+        console.warn('[Storage] Error reading channel_stats.json:', e);
+      }
     }
   } catch (err) {
     console.error('[Storage] Error reading local data files:', err);
@@ -285,51 +309,130 @@ export async function deletePlaylist(id: string): Promise<boolean> {
 }
 
 // -----------------------------------------------------------------------------
-// CHANNELS OPERATIONS
+// CHANNELS OPERATIONS & CLICK STATS
 // -----------------------------------------------------------------------------
+
+export function getChannelViews(channel: Channel): number {
+  if (channelClicksCache[channel.id] !== undefined) {
+    return channelClicksCache[channel.id];
+  }
+  if (channel.view_count !== undefined && channel.view_count > 0) {
+    return channel.view_count;
+  }
+  // Baseline initial views based on channel names/group popularity so 'Phổ biến nhất' starts with meaningful sorting
+  const name = (channel.name || '').toUpperCase();
+  const group = (channel.group || '').toUpperCase();
+  if (name.includes('VTV1') || name.includes('VTV3')) return 1520;
+  if (name.includes('VTV6') || name.includes('VTV2')) return 1180;
+  if (name.includes('VTV')) return 940;
+  if (name.includes('HTV7') || name.includes('HTV9')) return 890;
+  if (name.includes('HTV') || name.includes('VTC')) return 680;
+  if (name.includes('CẦN THƠ') || name.includes('ĐỒNG NAI')) return 540;
+  if (group.includes('VIỆT NAM')) return 420;
+  if (group.includes('THỂ THAO') || group.includes('SPORTS')) return 380;
+  if (group.includes('TIN TỨC') || group.includes('NEWS')) return 310;
+  if (group.includes('PHIM') || group.includes('MOVIES')) return 260;
+  if (group.includes('GIẢI TRÍ')) return 220;
+  return 65;
+}
+
+export async function recordChannelClick(id: string): Promise<number> {
+  let prev = channelClicksCache[id];
+  if (prev === undefined) {
+    const ch = channelsCache.find((c) => c.id === id);
+    prev = ch ? getChannelViews(ch) : 0;
+  }
+  const current = prev + 1;
+  channelClicksCache[id] = current;
+  scheduleSaveStats();
+
+  const channel = channelsCache.find((c) => c.id === id);
+  if (channel) {
+    channel.view_count = current;
+  }
+
+  if (pool) {
+    try {
+      const res = await pool.query(
+        'UPDATE channels SET view_count = COALESCE(view_count, 0) + 1 WHERE id = $1 RETURNING view_count',
+        [id]
+      );
+      if (res.rows[0]?.view_count !== undefined) {
+        return Number(res.rows[0].view_count);
+      }
+    } catch (err) {
+      console.error('[Storage] Postgres recordChannelClick error:', err);
+    }
+  }
+
+  return current;
+}
 
 export async function getAllActiveChannels(): Promise<Channel[]> {
   const playlists = await getPlaylists();
   const enabledPlaylistIds = new Set(playlists.filter((p) => p.enabled).map((p) => p.id));
+  let result: Channel[] = [];
 
   if (pool) {
     try {
       const res = await pool.query('SELECT * FROM channels WHERE status = $1', ['active']);
-      return res.rows.filter((c) => !c.playlist_id || enabledPlaylistIds.has(c.playlist_id));
+      result = res.rows.filter((c) => !c.playlist_id || enabledPlaylistIds.has(c.playlist_id));
     } catch (err) {
       console.error('[Storage] Postgres getAllActiveChannels error:', err);
     }
+  } else {
+    result = channelsCache.filter((c) => {
+      if (c.status === 'offline') return false;
+      if (c.playlist_id && !enabledPlaylistIds.has(c.playlist_id)) return false;
+      return true;
+    });
   }
 
-  return channelsCache.filter((c) => {
-    if (c.status === 'offline') return false;
-    if (c.playlist_id && !enabledPlaylistIds.has(c.playlist_id)) return false;
-    return true;
-  });
+  return result.map((c) => ({
+    ...c,
+    view_count: getChannelViews(c),
+  }));
 }
 
 export async function getAllChannelsAdmin(): Promise<Channel[]> {
+  let result: Channel[] = [];
   if (pool) {
     try {
       const res = await pool.query('SELECT * FROM channels ORDER BY name ASC');
-      return res.rows;
+      result = res.rows;
     } catch (err) {
       console.error('[Storage] Postgres getAllChannelsAdmin error:', err);
     }
+  } else {
+    result = [...channelsCache];
   }
-  return [...channelsCache];
+
+  return result.map((c) => ({
+    ...c,
+    view_count: getChannelViews(c),
+  }));
 }
 
 export async function getChannelById(id: string): Promise<Channel | null> {
+  let channel: Channel | null = null;
   if (pool) {
     try {
       const res = await pool.query('SELECT * FROM channels WHERE id = $1', [id]);
-      return res.rows[0] || null;
+      channel = res.rows[0] || null;
     } catch (err) {
       console.error('[Storage] Postgres getChannelById error:', err);
     }
+  } else {
+    channel = channelsCache.find((c) => c.id === id) || null;
   }
-  return channelsCache.find((c) => c.id === id) || null;
+
+  if (channel) {
+    return {
+      ...channel,
+      view_count: getChannelViews(channel),
+    };
+  }
+  return null;
 }
 
 export async function createChannel(data: Partial<Channel>): Promise<Channel> {

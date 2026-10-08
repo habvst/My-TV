@@ -4,6 +4,7 @@ import { parseM3U, generateM3U } from '../utils/m3uParser.js';
 import {
   getAllActiveChannels,
   getChannelById as getChannelFromDb,
+  recordChannelClick,
 } from '../src/db/storage.js';
 
 const router = Router();
@@ -26,10 +27,10 @@ export async function getAllGroups(): Promise<string[]> {
   return Array.from(groupsSet);
 }
 
-// API: Get channels with server-side search, group filtering, and pagination
+// API: Get channels with server-side search, group filtering, sorting, and pagination
 router.get('/api/channels', async (req: Request, res: Response) => {
   try {
-    const { q, group, page, limit } = req.query;
+    const { q, group, page, limit, sort } = req.query;
     let result = await getAllActiveChannels();
 
     // 1. Group filter
@@ -48,6 +49,25 @@ router.get('/api/channels', async (req: Request, res: Response) => {
           (c.tvg_id && c.tvg_id.toLowerCase().includes(query)) ||
           (c.description && c.description.toLowerCase().includes(query))
       );
+    }
+
+    // 3. Sorting logic: 'popular' (clicks/views), 'recent' (updated/added time), 'name' (A-Z), 'default'
+    if (sort === 'popular') {
+      result.sort((a, b) => {
+        const countA = a.view_count || 0;
+        const countB = b.view_count || 0;
+        if (countB !== countA) return countB - countA;
+        return a.name.localeCompare(b.name);
+      });
+    } else if (sort === 'recent') {
+      result.sort((a, b) => {
+        const timeA = a.updated_at || a.created_at ? new Date(a.updated_at || a.created_at || '').getTime() : 0;
+        const timeB = b.updated_at || b.created_at ? new Date(b.updated_at || b.created_at || '').getTime() : 0;
+        if (timeB !== timeA) return timeB - timeA;
+        return a.name.localeCompare(b.name);
+      });
+    } else if (sort === 'name' || sort === 'az') {
+      result.sort((a, b) => a.name.localeCompare(b.name));
     }
 
     const total = result.length;
@@ -76,6 +96,17 @@ router.get('/api/channels', async (req: Request, res: Response) => {
       totalPages,
       channels: paginated,
     });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// API: Record channel click / view
+router.post('/api/channels/:id/click', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const views = await recordChannelClick(id);
+    res.json({ success: true, id, view_count: views });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }

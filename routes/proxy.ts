@@ -5,6 +5,22 @@ import { URL } from 'url';
 
 const router = Router();
 
+// Reusable Keep-Alive agents to avoid TCP handshake overhead and socket exhaustion on IPTV streams
+const httpAgent = new http.Agent({
+  keepAlive: true,
+  maxSockets: 64,
+  maxFreeSockets: 16,
+  timeout: 60000,
+});
+
+const httpsAgent = new https.Agent({
+  keepAlive: true,
+  maxSockets: 64,
+  maxFreeSockets: 16,
+  timeout: 60000,
+  rejectUnauthorized: false, // Permit IPTV servers with self-signed or expired certs
+});
+
 // Handle preflight CORS requests
 router.options('/api/proxy/stream', (_req: Request, res: Response) => {
   res.header('Access-Control-Allow-Origin', '*');
@@ -18,6 +34,7 @@ router.options('/api/proxy/stream', (_req: Request, res: Response) => {
  * - Resolves CORS issues for modern browsers
  * - Bridges mixed-content (HTTP streams loaded on HTTPS pages)
  * - Automatically rewrites .m3u8 manifests so that chunklists and .ts segments route through this proxy
+ * - Maintains Keep-Alive connections to upstream IPTV servers
  */
 router.get('/api/proxy/stream', async (req: Request, res: Response) => {
   const targetUrl = req.query.url as string;
@@ -44,6 +61,7 @@ router.get('/api/proxy/stream', async (req: Request, res: Response) => {
   try {
     const isHttps = parsedUrl.protocol === 'https:';
     const client = isHttps ? https : http;
+    const agent = isHttps ? httpsAgent : httpAgent;
 
     const requestHeaders: Record<string, string> = {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
@@ -51,6 +69,11 @@ router.get('/api/proxy/stream', async (req: Request, res: Response) => {
       'Accept-Encoding': 'identity', // Do not gzip manifests so we can rewrite text
       'Connection': 'keep-alive',
     };
+
+    if (parsedUrl.origin) {
+      requestHeaders['Referer'] = parsedUrl.origin + '/';
+      requestHeaders['Origin'] = parsedUrl.origin;
+    }
 
     if (req.headers.range) {
       requestHeaders['Range'] = req.headers.range as string;
@@ -63,12 +86,13 @@ router.get('/api/proxy/stream', async (req: Request, res: Response) => {
       path: parsedUrl.pathname + parsedUrl.search,
       method: req.method === 'HEAD' ? 'HEAD' : 'GET',
       headers: requestHeaders,
-      timeout: 12000,
-      rejectUnauthorized: false, // Permit IPTV servers with self-signed or expired certs
+      agent,
+      timeout: 30000, // 30 seconds socket timeout to accommodate slower IPTV CDNs
+      rejectUnauthorized: false,
     };
 
     const proxyReq = client.request(requestOptions, (remoteRes) => {
-      // Handle HTTP redirects (301, 302, 307, 308)
+      // Handle HTTP redirects (301, 302, 303, 307, 308)
       if (
         remoteRes.statusCode &&
         [301, 302, 303, 307, 308].includes(remoteRes.statusCode) &&
@@ -103,7 +127,8 @@ router.get('/api/proxy/stream', async (req: Request, res: Response) => {
           }
 
           // Rewrite lines: any URI should go through /api/proxy/stream
-          const lines = manifestText.split(/\r?\n/);
+          // Handles \r\n, \r, and \n line breaks cleanly
+          const lines = manifestText.split(/\r\n|\r|\n/);
           const rewrittenLines = lines.map((line) => {
             const trimmed = line.trim();
             if (!trimmed) return line;
@@ -137,6 +162,8 @@ router.get('/api/proxy/stream', async (req: Request, res: Response) => {
           const rewrittenManifest = rewrittenLines.join('\n');
           res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
           res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+          res.setHeader('Pragma', 'no-cache');
+          res.setHeader('Expires', '0');
           return res.status(200).send(rewrittenManifest);
         });
 
@@ -158,6 +185,21 @@ router.get('/api/proxy/stream', async (req: Request, res: Response) => {
           res.setHeader('Accept-Ranges', remoteRes.headers['accept-ranges']);
         }
         res.setHeader('Cache-Control', 'public, max-age=60');
+
+        // Handle client abortion and remote stream errors cleanly
+        res.on('close', () => {
+          proxyReq.destroy();
+        });
+
+        remoteRes.on('error', (err) => {
+          console.warn('[Proxy] Segment streaming error:', err.message);
+          if (!res.headersSent) {
+            res.status(502).end();
+          } else {
+            res.destroy();
+          }
+        });
+
         remoteRes.pipe(res);
       }
     });

@@ -28,6 +28,8 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
 }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const hlsRef = useRef<Hls | null>(null);
+  const networkRetryCountRef = useRef<number>(0);
+  const mediaRetryCountRef = useRef<number>(0);
 
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
   const [isMuted, setIsMuted] = useState<boolean>(false);
@@ -37,7 +39,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
   const [copied, setCopied] = useState<boolean>(false);
   const [autoplayMuted, setAutoplayMuted] = useState<boolean>(false);
 
-  // Proxy state: auto-enable if stream is insecure HTTP loaded on HTTPS, or when direct fails
+  // Proxy state: auto-enable if stream is insecure HTTP loaded on HTTPS
   const [useProxy, setUseProxy] = useState<boolean>(() => {
     if (typeof window !== 'undefined' && channel?.stream_url) {
       return window.location.protocol === 'https:' && channel.stream_url.startsWith('http:');
@@ -51,7 +53,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
       if (proxyEnabled) {
         return `/api/proxy/stream?url=${encodeURIComponent(streamUrl)}`;
       }
-      // Force proxy if mixed-content (HTTP on HTTPS page)
+      // Force proxy only if mixed-content (HTTP on HTTPS page)
       if (
         typeof window !== 'undefined' &&
         window.location.protocol === 'https:' &&
@@ -64,29 +66,56 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
     []
   );
 
+  // Stop and clean up HLS and video element
+  const cleanupMedia = useCallback(() => {
+    if (hlsRef.current) {
+      try {
+        hlsRef.current.stopLoad();
+        hlsRef.current.detachMedia();
+        hlsRef.current.destroy();
+      } catch (err) {
+        console.warn('Error during HLS cleanup:', err);
+      }
+      hlsRef.current = null;
+    }
+    if (videoRef.current) {
+      try {
+        videoRef.current.pause();
+        videoRef.current.removeAttribute('src');
+        videoRef.current.load();
+      } catch {
+        // ignore
+      }
+    }
+  }, []);
+
   // Load and play stream
   const startPlayback = useCallback(
     (proxyMode: boolean) => {
-      if (!channel || !videoRef.current) return;
+      if (!channel) return;
+      cleanupMedia();
 
-      const video = videoRef.current;
       setHasError(false);
       setErrorMessage('');
       setIsLoading(true);
-
-      // Clean up previous HLS instance
-      if (hlsRef.current) {
-        hlsRef.current.destroy();
-        hlsRef.current = null;
-      }
+      networkRetryCountRef.current = 0;
+      mediaRetryCountRef.current = 0;
 
       const rawUrl = channel.stream_url.trim();
       const effectiveSource = getStreamSource(rawUrl, proxyMode);
+      const isHls =
+        channel.format === 'hls' ||
+        rawUrl.includes('.m3u8') ||
+        effectiveSource.includes('.m3u8');
+
+      const video = videoRef.current;
+      if (!video) {
+        return;
+      }
 
       // 1. Native HLS support (Safari iOS / macOS)
-      if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      if (isHls && video.canPlayType('application/vnd.apple.mpegurl')) {
         video.src = effectiveSource;
-        video.load();
         video
           .play()
           .then(() => {
@@ -96,7 +125,6 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
           })
           .catch((err) => {
             console.warn('Native playback error or unmuted autoplay blocked:', err);
-            // Fallback: try muted autoplay
             video.muted = true;
             setIsMuted(true);
             video
@@ -108,13 +136,14 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
               })
               .catch(() => {
                 if (!proxyMode) {
-                  console.info('Switching to proxy mode on native error...');
+                  cleanupMedia();
                   setUseProxy(true);
-                  startPlayback(true);
+                  setTimeout(() => startPlayback(true), 100);
                 } else {
+                  cleanupMedia();
                   setIsLoading(false);
                   setHasError(true);
-                  setErrorMessage('Trình duyệt không thể phát luồng này.');
+                  setErrorMessage('Trình duyệt không thể phát luồng này trực tiếp.');
                 }
               });
           });
@@ -122,11 +151,29 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
       }
 
       // 2. HLS.js for Chrome, Firefox, Edge, Android
-      if (Hls.isSupported()) {
+      if (isHls && Hls.isSupported()) {
         const hls = new Hls({
           enableWorker: true,
-          lowLatencyMode: true,
-          backBufferLength: 90,
+          lowLatencyMode: false, // Standard IPTV streams are regular HLS, not LL-HLS; false prevents buffer underruns
+          backBufferLength: 60,
+          maxBufferLength: 30, // Maintain a healthy 30-second buffer
+          maxMaxBufferLength: 60,
+          liveSyncDurationCount: 3, // Safe distance behind live edge
+          liveMaxLatencyDurationCount: 8,
+          liveDurationInfinity: true,
+          // Robust loading and retry settings for live streaming
+          manifestLoadingTimeOut: 20000,
+          manifestLoadingMaxRetry: 6,
+          manifestLoadingRetryDelay: 1000,
+          manifestLoadingMaxRetryTimeout: 64000,
+          levelLoadingTimeOut: 20000,
+          levelLoadingMaxRetry: 6,
+          levelLoadingRetryDelay: 1000,
+          levelLoadingMaxRetryTimeout: 64000,
+          fragLoadingTimeOut: 30000,
+          fragLoadingMaxRetry: 8,
+          fragLoadingRetryDelay: 1000,
+          fragLoadingMaxRetryTimeout: 64000,
           xhrSetup: (xhr) => {
             xhr.withCredentials = false;
           },
@@ -161,52 +208,93 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
             });
         });
 
+        // Reset retry counters on successful segment loaded
+        hls.on(Hls.Events.FRAG_LOADED, () => {
+          networkRetryCountRef.current = 0;
+          mediaRetryCountRef.current = 0;
+          setIsLoading(false);
+        });
+
         hls.on(Hls.Events.ERROR, (_event, data) => {
-          console.warn('HLS Event Error:', data);
-          if (data.fatal) {
-            switch (data.type) {
-              case Hls.ErrorTypes.NETWORK_ERROR:
+          if (!data.fatal) {
+            // Ignore non-fatal warnings (e.g. minor buffer gap, PTS nudge)
+            return;
+          }
+
+          console.warn('[HLS Fatal Error]:', data.type, data.details);
+
+          switch (data.type) {
+            case Hls.ErrorTypes.NETWORK_ERROR:
+              if (networkRetryCountRef.current < 6) {
+                networkRetryCountRef.current += 1;
+                console.info(
+                  `[HLS Recovery] Network glitch detected. Auto-recovering attempt ${networkRetryCountRef.current}/6...`
+                );
+                setIsLoading(true);
+                setTimeout(() => {
+                  if (hlsRef.current) {
+                    hlsRef.current.startLoad();
+                  }
+                }, 1000 * Math.min(networkRetryCountRef.current, 3));
+              } else {
+                networkRetryCountRef.current = 0;
+                // If direct mode exhausted retries, try switching to proxy
                 if (!proxyMode) {
-                  // Direct stream failed (CORS or server blocked). Auto switch to proxy!
-                  console.info('Direct stream blocked by CORS/network. Auto-enabling Proxy CORS...');
-                  hls.destroy();
-                  hlsRef.current = null;
+                  console.info('[HLS Fallback] Direct stream failed, auto-switching to Proxy CORS...');
+                  cleanupMedia();
                   setUseProxy(true);
-                  startPlayback(true);
+                  setTimeout(() => startPlayback(true), 200);
                 } else {
+                  cleanupMedia();
                   setHasError(true);
                   setErrorMessage(
-                    'Không thể kết nối đến máy chủ nguồn IPTV (Server luồng phát có thể đang ngoại tuyến hoặc đã đổi đường dẫn).'
+                    'Không thể kết nối đến máy chủ IPTV (Server nguồn có thể đang bảo trì, đổi link hoặc chặn kết nối).'
                   );
                   setIsLoading(false);
-                  hls.destroy();
                 }
-                break;
-              case Hls.ErrorTypes.MEDIA_ERROR:
+              }
+              break;
+
+            case Hls.ErrorTypes.MEDIA_ERROR:
+              mediaRetryCountRef.current += 1;
+              console.info(
+                `[HLS Recovery] Media decode error. Recovery attempt ${mediaRetryCountRef.current}/3...`
+              );
+              if (mediaRetryCountRef.current === 1) {
                 hls.recoverMediaError();
-                break;
-              default:
-                if (!proxyMode) {
-                  hls.destroy();
-                  hlsRef.current = null;
-                  setUseProxy(true);
-                  startPlayback(true);
-                } else {
-                  setHasError(true);
-                  setErrorMessage('Định dạng luồng phát không tương thích với trình duyệt hiện tại.');
-                  setIsLoading(false);
-                  hls.destroy();
-                }
-                break;
-            }
+              } else if (mediaRetryCountRef.current === 2) {
+                hls.swapAudioCodec();
+                hls.recoverMediaError();
+              } else {
+                mediaRetryCountRef.current = 0;
+                cleanupMedia();
+                setTimeout(() => startPlayback(proxyMode), 500);
+              }
+              break;
+
+            default:
+              cleanupMedia();
+              setHasError(true);
+              setErrorMessage('Định dạng luồng phát không tương thích với trình duyệt hiện tại.');
+              setIsLoading(false);
+              break;
           }
         });
         return;
       }
 
-      // 3. Direct HTML5 video fallback (MP4 or HTTP)
+      // 3. Fallback: If it's HLS, but neither native HLS nor Hls.js is supported
+      if (isHls) {
+        setIsLoading(false);
+        setHasError(true);
+        setErrorMessage(
+          'Trình duyệt không hỗ trợ công nghệ MediaSource HLS để phát luồng IPTV này trực tiếp. Vui lòng mở bằng VLC hoặc CorePlayer.'
+        );
+        return;
+      }
+
+      // 4. Direct HTML5 video fallback (MP4 or HTTP)
       video.src = effectiveSource;
-      video.load();
       video
         .play()
         .then(() => {
@@ -215,35 +303,82 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
         })
         .catch(() => {
           if (!proxyMode) {
+            cleanupMedia();
             setUseProxy(true);
-            startPlayback(true);
+            setTimeout(() => startPlayback(true), 100);
           } else {
+            cleanupMedia();
             setHasError(true);
             setErrorMessage('Trình duyệt không hỗ trợ giải mã trực tiếp luồng này.');
             setIsLoading(false);
           }
         });
     },
-    [channel, getStreamSource]
+    [channel, getStreamSource, cleanupMedia]
   );
+
+  // Catch unhandled native video element errors (only if Hls.js is not handling it)
+  const handleVideoError = (e: React.SyntheticEvent<HTMLVideoElement, Event>) => {
+    // If Hls.js is active, let Hls.js handle errors through its internal pipeline
+    if (hlsRef.current) {
+      return;
+    }
+
+    e.preventDefault();
+    e.stopPropagation();
+    const mediaError = videoRef.current?.error;
+    console.warn('Caught video element error:', mediaError?.code, mediaError?.message);
+
+    cleanupMedia();
+    setIsPlaying(false);
+    setIsLoading(false);
+
+    if (!useProxy && channel) {
+      console.info('Auto-switching to proxy mode after video element error...');
+      setUseProxy(true);
+      setTimeout(() => {
+        startPlayback(true);
+      }, 100);
+      return;
+    }
+
+    setHasError(true);
+    setErrorMessage(
+      'Nguồn phát IPTV thường chặn CORS hoặc sử dụng giao thức chỉ hỗ trợ trên app chuyên dụng (VLC, CorePlayer).'
+    );
+  };
 
   // Trigger playback when channel changes, playTrigger increments, or useProxy toggles
   useEffect(() => {
     if (!channel) return;
+    cleanupMedia();
+    setHasError(false);
+
     const initialProxy =
       typeof window !== 'undefined' &&
       window.location.protocol === 'https:' &&
       channel.stream_url.startsWith('http:');
     setUseProxy(initialProxy);
-    startPlayback(initialProxy);
+
+    const timer = setTimeout(() => {
+      startPlayback(initialProxy);
+    }, 50);
 
     return () => {
-      if (hlsRef.current) {
-        hlsRef.current.destroy();
-        hlsRef.current = null;
-      }
+      clearTimeout(timer);
+      cleanupMedia();
     };
-  }, [channel, playTrigger, startPlayback]);
+  }, [channel, playTrigger, cleanupMedia, startPlayback]);
+
+  // Synchronize audio muted / volume state with native video element
+  const syncAudioState = useCallback(() => {
+    if (!videoRef.current) return;
+    const isActuallyMuted = videoRef.current.muted || videoRef.current.volume === 0;
+    setIsMuted(isActuallyMuted);
+    if (!isActuallyMuted) {
+      setAutoplayMuted(false);
+    }
+  }, []);
 
   // User interactions
   const handleTogglePlay = () => {
@@ -256,52 +391,80 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
         .play()
         .then(() => {
           setIsPlaying(true);
-          setAutoplayMuted(false);
+          syncAudioState();
         })
         .catch(() => {
           // If unmuted play failed, try muted
           if (videoRef.current) {
             videoRef.current.muted = true;
             setIsMuted(true);
+            setAutoplayMuted(true);
             videoRef.current.play().then(() => {
               setIsPlaying(true);
-              setAutoplayMuted(true);
             });
           }
         });
     }
   };
 
-  const handleToggleMute = () => {
+  const handleToggleMute = (e?: React.MouseEvent) => {
+    if (e) {
+      e.stopPropagation();
+    }
     if (!videoRef.current) return;
-    const newMuted = !videoRef.current.muted;
+    const currentMuted = videoRef.current.muted || videoRef.current.volume === 0;
+    const newMuted = !currentMuted;
     videoRef.current.muted = newMuted;
+    if (!newMuted && videoRef.current.volume === 0) {
+      videoRef.current.volume = 1;
+    }
     setIsMuted(newMuted);
     if (!newMuted) {
       setAutoplayMuted(false);
     }
   };
 
-  const handleUnmuteAudio = () => {
+  const handleUnmuteAudio = (e?: React.MouseEvent) => {
+    if (e) {
+      e.stopPropagation();
+    }
     if (!videoRef.current) return;
     videoRef.current.muted = false;
+    if (videoRef.current.volume === 0) {
+      videoRef.current.volume = 1;
+    }
     setIsMuted(false);
     setAutoplayMuted(false);
   };
 
   const handleToggleProxy = () => {
+    cleanupMedia();
     const nextProxy = !useProxy;
     setUseProxy(nextProxy);
-    startPlayback(nextProxy);
+    setHasError(false);
+    setIsLoading(true);
+    setTimeout(() => {
+      startPlayback(nextProxy);
+    }, 50);
   };
 
   const handleRetry = () => {
-    startPlayback(useProxy);
+    cleanupMedia();
+    setHasError(false);
+    setIsLoading(true);
+    setTimeout(() => {
+      startPlayback(useProxy);
+    }, 50);
   };
 
   const handleForceProxyRetry = () => {
+    cleanupMedia();
     setUseProxy(true);
-    startPlayback(true);
+    setHasError(false);
+    setIsLoading(true);
+    setTimeout(() => {
+      startPlayback(true);
+    }, 50);
   };
 
   const handleCopy = () => {
@@ -338,52 +501,82 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
     <div className="w-full bg-neutral-900 border border-neutral-800 rounded-xl overflow-hidden shadow-2xl flex flex-col">
       {/* Video Canvas Container */}
       <div className="relative w-full aspect-video bg-black flex items-center justify-center group overflow-hidden">
-        <video
-          ref={videoRef}
-          className="w-full h-full object-contain cursor-pointer"
-          playsInline
-          controls
-          onClick={handleTogglePlay}
-          onPlay={() => setIsPlaying(true)}
-          onPause={() => setIsPlaying(false)}
-        />
+        {!hasError ? (
+          <>
+            <video
+              ref={videoRef}
+              className="w-full h-full object-contain cursor-pointer"
+              playsInline
+              controls
+              onClick={handleTogglePlay}
+              onPlay={() => {
+                setIsPlaying(true);
+                syncAudioState();
+              }}
+              onPause={() => setIsPlaying(false)}
+              onVolumeChange={syncAudioState}
+              onLoadedMetadata={syncAudioState}
+              onError={handleVideoError}
+            />
 
-        {/* Autoplay Muted Notice */}
-        {isPlaying && autoplayMuted && (
-          <div
-            onClick={handleUnmuteAudio}
-            className="absolute top-3 left-1/2 -translate-x-1/2 z-20 bg-amber-500 text-neutral-950 px-3.5 py-1.5 rounded-full font-bold text-xs flex items-center gap-1.5 shadow-lg cursor-pointer hover:bg-amber-400 transition animate-bounce"
-            title="Nhấn để bật âm thanh"
-          >
-            <VolumeX className="w-4 h-4" />
-            <span>Đang tắt tiếng. Bấm vào đây để BẬT TIẾNG!</span>
-          </div>
-        )}
+            {/* Top Sound Control (Biểu tượng tiếng trên) */}
+            <button
+              type="button"
+              onClick={handleToggleMute}
+              className={`absolute top-3 right-3 z-20 px-2.5 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 border shadow-lg backdrop-blur-md transition cursor-pointer ${
+                isMuted
+                  ? 'bg-rose-950/85 text-rose-300 border-rose-700/80 hover:bg-rose-900/90'
+                  : 'bg-emerald-950/85 text-emerald-300 border-emerald-700/80 hover:bg-emerald-900/90'
+              }`}
+              title={isMuted ? 'Bật âm thanh (Unmute)' : 'Tắt tiếng (Mute)'}
+            >
+              {isMuted ? (
+                <VolumeX className="w-4 h-4 text-rose-400" />
+              ) : (
+                <Volume2 className="w-4 h-4 text-emerald-400" />
+              )}
+              <span className="text-[11px] font-bold">
+                {isMuted ? 'Tắt tiếng' : 'Bật tiếng'}
+              </span>
+            </button>
 
-        {/* Big Center Play Button Overlay (when paused and not loading/errored) */}
-        {!isPlaying && !isLoading && !hasError && (
-          <button
-            type="button"
-            onClick={handleTogglePlay}
-            className="absolute z-10 w-16 h-16 rounded-full bg-amber-500 hover:bg-amber-400 text-neutral-950 flex items-center justify-center shadow-2xl shadow-amber-500/50 hover:scale-110 active:scale-95 transition-all"
-            title="Bấm để phát (Play)"
-          >
-            <Play className="w-8 h-8 fill-current ml-1" />
-          </button>
-        )}
+            {/* Autoplay / Muted Notice */}
+            {isPlaying && isMuted && (
+              <button
+                type="button"
+                onClick={handleUnmuteAudio}
+                className="absolute top-3 left-1/2 -translate-x-1/2 z-20 bg-amber-500 hover:bg-amber-400 text-neutral-950 px-3.5 py-1.5 rounded-full font-bold text-xs flex items-center gap-1.5 shadow-lg cursor-pointer transition animate-bounce border border-amber-300"
+                title="Nhấn để bật âm thanh"
+              >
+                <VolumeX className="w-4 h-4" />
+                <span>Đang tắt tiếng. Bấm vào đây để BẬT TIẾNG!</span>
+              </button>
+            )}
 
-        {/* Loading Overlay */}
-        {isLoading && (
-          <div className="absolute inset-0 bg-black/80 flex flex-col items-center justify-center pointer-events-none z-10">
-            <RefreshCw className="w-10 h-10 text-amber-400 animate-spin mb-2" />
-            <p className="text-xs text-neutral-300 font-semibold tracking-wide">
-              {useProxy ? 'ĐANG KẾT NỐI QUA PROXY CORS...' : 'ĐANG TẢI LUỒNG PHÁT...'}
-            </p>
-          </div>
-        )}
+            {/* Big Center Play Button Overlay (when paused and not loading) */}
+            {!isPlaying && !isLoading && (
+              <button
+                type="button"
+                onClick={handleTogglePlay}
+                className="absolute z-10 w-16 h-16 rounded-full bg-amber-500 hover:bg-amber-400 text-neutral-950 flex items-center justify-center shadow-2xl shadow-amber-500/50 hover:scale-110 active:scale-95 transition-all"
+                title="Bấm để phát (Play)"
+              >
+                <Play className="w-8 h-8 fill-current ml-1" />
+              </button>
+            )}
 
-        {/* Error Fallback Banner */}
-        {hasError && (
+            {/* Loading Overlay */}
+            {isLoading && (
+              <div className="absolute inset-0 bg-black/80 flex flex-col items-center justify-center pointer-events-none z-10">
+                <RefreshCw className="w-10 h-10 text-amber-400 animate-spin mb-2" />
+                <p className="text-xs text-neutral-300 font-semibold tracking-wide">
+                  {useProxy ? 'ĐANG KẾT NỐI QUA PROXY CORS...' : 'ĐANG TẢI LUỒNG PHÁT...'}
+                </p>
+              </div>
+            )}
+          </>
+        ) : (
+          /* Error Fallback Banner */
           <div className="absolute inset-0 bg-neutral-950/95 flex flex-col items-center justify-center p-6 text-center z-20 overflow-y-auto">
             <AlertCircle className="w-12 h-12 text-rose-500 mb-2" />
             <h4 className="text-base font-bold text-white">Không thể phát trực tiếp trên trình duyệt</h4>
@@ -517,13 +710,23 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
             <span className="hidden sm:inline">{isPlaying ? 'Tạm dừng' : 'Phát'}</span>
           </button>
 
+          {/* Bottom Sound Control (Biểu tượng tiếng dưới) */}
           <button
             type="button"
             onClick={handleToggleMute}
-            className="p-1.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-200 rounded-lg text-xs border border-neutral-700 transition"
-            title={isMuted ? 'Bật âm thanh' : 'Tắt tiếng'}
+            className={`px-2.5 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 border transition ${
+              isMuted
+                ? 'bg-rose-950/60 text-rose-300 border-rose-800/60 hover:bg-rose-900/60'
+                : 'bg-emerald-950/60 text-emerald-300 border-emerald-800/60 hover:bg-emerald-900/60'
+            }`}
+            title={isMuted ? 'Bật âm thanh (Unmute)' : 'Tắt tiếng (Mute)'}
           >
-            {isMuted ? <VolumeX className="w-3.5 h-3.5 text-rose-400" /> : <Volume2 className="w-3.5 h-3.5 text-neutral-300" />}
+            {isMuted ? (
+              <VolumeX className="w-3.5 h-3.5 text-rose-400" />
+            ) : (
+              <Volume2 className="w-3.5 h-3.5 text-emerald-400" />
+            )}
+            <span>{isMuted ? 'Tắt tiếng' : 'Bật tiếng'}</span>
           </button>
 
           <button

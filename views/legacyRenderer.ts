@@ -256,8 +256,10 @@ export function renderLegacyHome(options: {
             <span class="channel-group-tag">${escapeHtml(ch.group)}</span>
             <span style="font-size:11px;color:#aaa;">${escapeHtml(ch.resolution || 'HD')} / ${escapeHtml(ch.format.toUpperCase())}</span>
           </div>
-          <div style="margin-top:4px;">
-            <a class="btn" style="background-color:#b33939;padding:3px 6px;" href="/open/${encodeURIComponent(ch.id)}">[ Mở CorePlayer ]</a>
+          <div style="margin-top:5px;line-height:1.9;">
+            <a class="btn" style="background-color:#16a085;border-color:#1abc9c;color:#fff;padding:3px 6px;font-weight:bold;" href="/e72/play/${encodeURIComponent(ch.id)}?type=m3u">&#9889; 1-Chạm M3U</a>
+            <a class="btn" style="background-color:#007acc;border-color:#3399ff;color:#fff;padding:3px 6px;font-weight:bold;" href="/e72/stream/${encodeURIComponent(ch.id)}.ts">&#9654; MPEG-TS</a>
+            <a class="btn" style="background-color:#8e44ad;border-color:#9b59b6;color:#fff;padding:3px 6px;font-weight:bold;" href="/e72/stream/${encodeURIComponent(ch.id)}.mp4">&#127916; MP4</a>
             <a class="btn" style="padding:3px 6px;" href="/legacy/channel/${encodeURIComponent(ch.id)}">[ Chi tiết ]</a>
           </div>
         </li>
@@ -358,7 +360,8 @@ ${LEGACY_CSS}
 }
 
 export function renderLegacyChannel(channel: Channel): string {
-  const directOpenUrl = `/open/${encodeURIComponent(channel.id)}`;
+  const e72StreamUrl = `/e72/stream/${encodeURIComponent(channel.id)}`;
+  const e72M3uUrl = `/e72/channel/${encodeURIComponent(channel.id)}.m3u`;
   const directStreamUrl = channel.stream_url;
 
   return `<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
@@ -366,28 +369,45 @@ export function renderLegacyChannel(channel: Channel): string {
 <head>
   <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
-  <title>${escapeHtml(channel.name)} - MY IPTV</title>
+  <title>${escapeHtml(channel.name)} - Nokia E72 Transcoded Stream</title>
   <style type="text/css">
 ${LEGACY_CSS}
   </style>
 </head>
 <body>
   <div class="detect-banner">
-    &#10003; TỰ ĐỘNG NHẬN DIỆN: NOKIA E72 / S60
+    &#10003; TỰ ĐỘNG CHUYỂN MÃ: CHUẨN PHẦN CỨNG NOKIA E72 (QVGA 320x240)
   </div>
 
   <div class="header">
     <h1>${escapeHtml(channel.name)}</h1>
-    <div style="font-size:11px;color:#f4d35e;">Nhóm: ${escapeHtml(channel.group)}</div>
+    <div style="font-size:11px;color:#f4d35e;">Nhóm: ${escapeHtml(channel.group)} &bull; Mã: ${escapeHtml(channel.id)}</div>
   </div>
 
   <div class="box" style="text-align:center;">
-    <a class="btn-coreplayer" href="${directOpenUrl}">
-      &#9654; MỞ BẰNG COREPLAYER
+    <!-- Nút 1: 1-Chạm mở CorePlayer bằng inline M3U -->
+    <a class="btn" style="background-color:#16a085;border-color:#1abc9c;color:#fff;font-size:14px;padding:9px 12px;font-weight:bold;display:block;margin-bottom:6px;" href="/e72/play/${encodeURIComponent(channel.id)}?type=m3u">
+      &#9889; 1-CHẠM: MỞ TỰ ĐỘNG BẰNG COREPLAYER (M3U INLINE)
     </a>
 
-    <a class="btn-stream" href="${escapeHtml(directStreamUrl)}">
-      &#9654; MỞ STREAM TRỰC TIẾP (HTTP)
+    <!-- Nút 2: Luồng trực tiếp MPEG-TS (320x240) -->
+    <a class="btn" style="background-color:#007acc;border-color:#3399ff;color:#fff;font-size:13px;padding:8px 12px;font-weight:bold;display:block;margin-bottom:6px;" href="/e72/stream/${encodeURIComponent(channel.id)}.ts">
+      &#9654; 1-CHẠM: LUỒNG TRỰC TIẾP MPEG-TS (video/MP2T)
+    </a>
+
+    <!-- Nút 3: Luồng trực tiếp MP4 (RealPlayer & CorePlayer) -->
+    <a class="btn" style="background-color:#8e44ad;border-color:#9b59b6;color:#fff;font-size:13px;padding:8px 12px;font-weight:bold;display:block;margin-bottom:6px;" href="/e72/stream/${encodeURIComponent(channel.id)}.mp4">
+      &#127916; 1-CHẠM: LUỒNG TRỰC TIẾP MP4 (video/mp4 - REALPLAYER)
+    </a>
+
+    <!-- Nút 4: RealPlayer RAM Metafile -->
+    <a class="btn" style="background-color:#d35400;border-color:#e67e22;color:#fff;font-size:12px;padding:6px 10px;display:block;margin-bottom:6px;" href="/e72/play/${encodeURIComponent(channel.id)}?type=ram">
+      &#128251; MỞ BẰNG REALPLAYER (.RAM METAFILE)
+    </a>
+
+    <!-- Nút 5: Mở bằng URI Scheme CorePlayer:// -->
+    <a class="btn" style="background-color:#2c3e50;border-color:#7f8c8d;color:#fff;font-size:12px;padding:6px 10px;display:block;margin-bottom:6px;" href="/e72/play/${encodeURIComponent(channel.id)}?type=coreplayer">
+      &#128241; MỞ QUA COREPLAYER:// SCHEME
     </a>
 
     <div style="margin: 8px 0;">
@@ -396,36 +416,41 @@ ${LEGACY_CSS}
   </div>
 
   <div class="box">
-    <strong>URL STREAM (Nhấn giữ để copy):</strong>
-    <div class="url-box">${escapeHtml(directStreamUrl)}</div>
-    <textarea rows="2" style="width:96%;font-size:11px;background:#111;color:#0f6;border:1px solid #444;" readonly="readonly">${escapeHtml(directStreamUrl)}</textarea>
+    <strong>URL LUỒNG E72 (Dán vào CorePlayer &gt; Open URL):</strong>
+    <div class="url-box">${e72StreamUrl}.ts</div>
+    <textarea rows="2" style="width:96%;font-size:11px;background:#111;color:#0f6;border:1px solid #444;" readonly="readonly">${e72StreamUrl}.ts</textarea>
   </div>
 
   <div class="box">
-    <strong>HƯỚNG DẪN XEM TRÊN NOKIA E72:</strong>
-    <div class="guide-step"><b>Cách 1:</b> Nhấn nút <b>[ MỞ BẰNG COREPLAYER ]</b> ở trên. Nếu điện thoại hỏi ứng dụng, chọn CorePlayer.</div>
-    <div class="guide-step"><b>Cách 2 (Thủ công chuẩn nhất):</b></div>
-    <div class="guide-step">1. Nhấn giữ hoặc bôi đen URL màu xanh lá cây ở trên rồi bấm <b>Copy (Sao chép)</b>.</div>
-    <div class="guide-step">2. Khởi động ứng dụng <b>CorePlayer</b> trên Nokia E72.</div>
-    <div class="guide-step">3. Chọn <b>Menu &gt; Open URL... (Mở URL)</b>.</div>
-    <div class="guide-step">4. Dán (Paste) URL đã copy và bấm <b>OK / Play</b>.</div>
+    <strong>HƯỚNG DẪN CƠ CHẾ 1-CHẠM TRÊN NOKIA E72:</strong>
+    <div class="guide-step">&#8226; <b>Cách 1 (Chuẩn nhất - Đã cài CorePlayer):</b> Nhấn nút xanh lá cây <b>[ ⚡ 1-CHẠM: MỞ TỰ ĐỘNG BẰNG COREPLAYER ]</b>. Trình duyệt S60 tự nạp MIME <code>audio/x-mpegurl</code> và kích hoạt ngay CorePlayer để phát!</div>
+    <div class="guide-step">&#8226; <b>Cách 2 (Máy chỉ có RealPlayer):</b> Nhấn nút <b>[ 🎬 LUỒNG TRỰC TIẾP MP4 ]</b> hoặc <b>[ 📻 FILE .RAM ]</b>. RealPlayer mặc định của E72 sẽ mở lên phát trực tiếp luồng QVGA.</div>
+    <div class="guide-step">&#8226; <b>Cách 3 (Nhập URL thủ công):</b> Mở <b>CorePlayer &gt; Menu &gt; Open URL...</b> &gt; dán URL màu xanh lá ở trên &gt; bấm <b>OK</b>.</div>
   </div>
 
   <div class="box">
-    <strong>THÔNG SỐ KỸ THUẬT:</strong>
+    <strong>THÔNG SỐ KỸ THUẬT GATEWAY E72:</strong>
     <div style="font-size:11px;color:#bbb;">
-      &#8226; Định dạng: <b>${escapeHtml(channel.format.toUpperCase())}</b><br />
-      &#8226; Video Codec: <b>${escapeHtml(channel.video_codec || 'H.264')}</b><br />
-      &#8226; Audio Codec: <b>${escapeHtml(channel.audio_codec || 'AAC')}</b><br />
-      &#8226; Độ phân giải: <b>${escapeHtml(channel.resolution || 'HD')}</b><br />
-      ${channel.description ? `&#8226; Mô tả: ${escapeHtml(channel.description)}` : ''}
+      &#8226; Phân giải: <b>320x240 (QVGA, đúng tỷ lệ E72)</b><br />
+      &#8226; Video Codec: <b>H.264 Baseline Profile @ Level 1.2</b><br />
+      &#8226; Bitrate Video: <b>350 kbps (Tối đa 400 kbps, 24fps)</b><br />
+      &#8226; Audio Codec: <b>AAC-LC 64 kbps, 44.1 kHz Stereo</b><br />
+      &#8226; Định dạng nạp: <b>MPEG-TS qua HTTP thuần (Không lỗi SSL/TLS)</b><br />
+      &#8226; Tải CPU E72 dự kiến: <b>Chỉ khoảng 30% - 45%</b><br />
+    </div>
+  </div>
+
+  <div class="box">
+    <strong>LUỒNG GỐC CỦA NHÀ ĐÀI:</strong>
+    <div style="font-size:10px;color:#888;word-break:break-all;">
+      ${escapeHtml(directStreamUrl)}
     </div>
   </div>
 
   <div class="footer">
     <a href="/legacy">&laquo; Danh sách kênh</a> |
-    <a href="/?view=modern">Bản hiện đại</a> |
-    <a href="/?view=reset">Khôi phục Tự Động</a>
+    <a href="/e72/playlist.m3u">Tải toàn bộ Playlist E72</a> |
+    <a href="/?view=modern">Bản hiện đại</a>
   </div>
 </body>
 </html>`;

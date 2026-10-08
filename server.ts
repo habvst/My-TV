@@ -6,6 +6,7 @@ import channelsRouter, { getAllChannels, getAllGroups, getChannelById } from './
 import playerRouter from './routes/player.js';
 import adminRouter from './routes/admin.js';
 import proxyRouter from './routes/proxy.js';
+import e72Router from './routes/e72.js';
 import { getPlaylists } from './src/db/storage.js';
 import { detectDevice } from './utils/deviceDetector.js';
 import { renderLegacyHome, renderLegacyChannel, renderLegacyNotFound } from './views/legacyRenderer.js';
@@ -17,7 +18,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-const PORT = parseInt(process.env.PORT || '3000', 10);
+const PORT = (process.env.PORT && process.env.PORT !== '8080') ? parseInt(process.env.PORT, 10) : 3000;
 const isProd = process.env.NODE_ENV === 'production';
 
 // Helper to parse cookie string
@@ -94,6 +95,7 @@ app.use(channelsRouter);
 app.use(playerRouter);
 app.use(adminRouter);
 app.use(proxyRouter);
+app.use(e72Router);
 
 // -----------------------------------------------------------------------------
 // LEGACY NOKIA E72 / SYMBIAN S60 ROUTES
