@@ -18,24 +18,37 @@ const activeTranscodingSessions = new Map<string, { pid: number; channelId: stri
  * - Converts audio to AAC-LC 64 kbps, 44.1 kHz stereo
  * - Serves over plain HTTP with inline Content-Disposition for 1-Touch opening
  */
-router.get(['/e72/stream/:id', '/e72/stream/:id.:ext'], async (req: Request, res: Response) => {
-  const { id } = req.params;
-  const ext = (req.params.ext || '').toLowerCase();
+router.get(['/e72/stream/:id.:ext', '/e72/stream/:id'], async (req: Request, res: Response) => {
+  let channelId = req.params.id;
+  const extParam = (req.params.ext || '').toLowerCase();
   const formatQuery = (req.query.format as string || '').toLowerCase();
-  const isMp4 = ext === 'mp4' || formatQuery === 'mp4';
 
-  const channel = await getChannelById(id);
+  let isMp4 = extParam === 'mp4' || formatQuery === 'mp4';
+
+  // Handle case where Express matched extension as part of :id (e.g. 'cantho1.mp4' or 'cantho1.ts')
+  if (channelId.endsWith('.mp4')) {
+    channelId = channelId.slice(0, -4);
+    isMp4 = true;
+  } else if (channelId.endsWith('.ts')) {
+    channelId = channelId.slice(0, -3);
+  }
+
+  // Lookup channel by sanitized id first, then fallback to original id
+  let channel = await getChannelById(channelId);
+  if (!channel && channelId !== req.params.id) {
+    channel = await getChannelById(req.params.id);
+  }
 
   if (!channel) {
     return res.status(404).send('Kênh không tồn tại');
   }
 
   const clientIp = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress || 'unknown';
-  const sessionId = `${id}-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
-  console.log(`[E72 Transcode] Starting ${isMp4 ? 'MP4' : 'MPEG-TS'} stream for "${channel.name}" (${id}) to ${clientIp} [Session: ${sessionId}]`);
+  const sessionId = `${channel.id}-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+  console.log(`[E72 Transcode] Starting ${isMp4 ? 'MP4' : 'MPEG-TS'} stream for "${channel.name}" (${channel.id}) to ${clientIp} [Session: ${sessionId}]`);
 
   // Record click / view asynchronously
-  recordChannelClick(id).catch(() => {});
+  recordChannelClick(channel.id).catch(() => {});
 
   // Set HTTP headers optimized for Symbian / CorePlayer / RealPlayer
   const contentType = isMp4 ? 'video/mp4' : 'video/MP2T';
@@ -107,7 +120,7 @@ router.get(['/e72/stream/:id', '/e72/stream/:id.:ext'], async (req: Request, res
   if (ffmpeg.pid) {
     activeTranscodingSessions.set(sessionId, {
       pid: ffmpeg.pid,
-      channelId: id,
+      channelId: channel.id,
       startTime: Date.now(),
       clientIp,
       process: ffmpeg,
@@ -173,10 +186,31 @@ router.get(['/e72/stream/:id', '/e72/stream/:id.:ext'], async (req: Request, res
  * - ?type=ram: RealPlayer RAM metafile (audio/x-pn-realaudio) for RealPlayer.
  * - ?type=coreplayer: Redirects to coreplayer:// scheme.
  */
-router.get('/e72/play/:id', async (req: Request, res: Response) => {
-  const { id } = req.params;
-  const type = ((req.query.type as string) || (req.query.format as string) || 'm3u').toLowerCase();
-  const channel = await getChannelById(id);
+router.get(['/e72/play/:id.:ext', '/e72/play/:id'], async (req: Request, res: Response) => {
+  let channelId = req.params.id;
+  const extParam = (req.params.ext || '').toLowerCase();
+  let type = ((req.query.type as string) || (req.query.format as string) || extParam || '').toLowerCase();
+
+  if (channelId.endsWith('.mp4')) {
+    channelId = channelId.slice(0, -4);
+    if (!type) type = 'mp4';
+  } else if (channelId.endsWith('.ts')) {
+    channelId = channelId.slice(0, -3);
+    if (!type) type = 'ts';
+  } else if (channelId.endsWith('.m3u')) {
+    channelId = channelId.slice(0, -4);
+    if (!type) type = 'm3u';
+  } else if (channelId.endsWith('.ram')) {
+    channelId = channelId.slice(0, -4);
+    if (!type) type = 'ram';
+  }
+
+  if (!type) type = 'm3u';
+
+  let channel = await getChannelById(channelId);
+  if (!channel && channelId !== req.params.id) {
+    channel = await getChannelById(req.params.id);
+  }
 
   if (!channel) {
     return res.status(404).send('Kênh không tồn tại');
@@ -224,9 +258,16 @@ ${streamUrl}
  * Endpoint /e72/channel/:id.m3u
  * Single-channel M3U playlist file for Nokia E72 CorePlayer one-click opening
  */
-router.get('/e72/channel/:id.m3u', async (req: Request, res: Response) => {
-  const { id } = req.params;
-  const channel = await getChannelById(id);
+router.get(['/e72/channel/:id.m3u', '/e72/channel/:id'], async (req: Request, res: Response) => {
+  let channelId = req.params.id;
+  if (channelId.endsWith('.m3u')) {
+    channelId = channelId.slice(0, -4);
+  }
+
+  let channel = await getChannelById(channelId);
+  if (!channel && channelId !== req.params.id) {
+    channel = await getChannelById(req.params.id);
+  }
 
   if (!channel) {
     return res.status(404).send('Kênh không tồn tại');

@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { Channel } from '../types/iptv';
-import { X, Copy, Check, ExternalLink, Play, Tv, ShieldCheck, Smartphone } from 'lucide-react';
+import { X, Copy, Check, ExternalLink, Play, Tv, ShieldCheck, Smartphone, Zap, Film } from 'lucide-react';
 
 interface ChannelDetailsModalProps {
   channel: Channel | null;
@@ -13,17 +13,28 @@ export const ChannelDetailsModal: React.FC<ChannelDetailsModalProps> = ({
   onClose,
   onPlayChannel,
 }) => {
-  const [copied, setCopied] = useState<boolean>(false);
+  const [copiedOriginal, setCopiedOriginal] = useState<boolean>(false);
+  const [copiedE72, setCopiedE72] = useState<boolean>(false);
 
   if (!channel) return null;
 
-  const handleCopyUrl = () => {
+  const origin = typeof window !== 'undefined' ? window.location.origin : '';
+  const e72StreamTsUrl = `${origin}/e72/stream/${channel.id}.ts`;
+  const e72M3uLauncherUrl = `${origin}/e72/play/${channel.id}?type=m3u`;
+  const e72StreamMp4Url = `${origin}/e72/stream/${channel.id}.mp4`;
+  const corePlayerLink = `/open/${channel.id}`;
+
+  const handleCopyOriginal = () => {
     navigator.clipboard.writeText(channel.stream_url);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+    setCopiedOriginal(true);
+    setTimeout(() => setCopiedOriginal(false), 2000);
   };
 
-  const corePlayerLink = `/open/${channel.id}`;
+  const handleCopyE72 = () => {
+    navigator.clipboard.writeText(e72StreamTsUrl);
+    setCopiedE72(true);
+    setTimeout(() => setCopiedE72(false), 2000);
+  };
 
   return (
     <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 overflow-y-auto">
@@ -62,7 +73,7 @@ export const ChannelDetailsModal: React.FC<ChannelDetailsModalProps> = ({
           {/* Stream URL Box */}
           <div>
             <label className="text-xs font-semibold text-neutral-300 block mb-1.5">
-              URL LUỒNG PHÁT (STREAM URL)
+              URL LUỒNG PHÁT GỐC (ORIGINAL STREAM URL)
             </label>
             <div className="flex items-center gap-2">
               <input
@@ -72,12 +83,122 @@ export const ChannelDetailsModal: React.FC<ChannelDetailsModalProps> = ({
                 className="w-full bg-neutral-950 border border-neutral-800 text-emerald-400 text-xs font-mono p-2.5 rounded-lg focus:outline-none selection:bg-emerald-950"
               />
               <button
-                onClick={handleCopyUrl}
+                type="button"
+                onClick={handleCopyOriginal}
                 className="px-3 py-2.5 bg-neutral-800 hover:bg-neutral-700 text-white rounded-lg text-xs font-medium flex items-center gap-1.5 transition flex-shrink-0 border border-neutral-700"
               >
-                {copied ? <Check className="w-4 h-4 text-emerald-400" /> : <Copy className="w-4 h-4 text-amber-400" />}
-                <span>{copied ? 'Đã copy' : 'Copy'}</span>
+                {copiedOriginal ? <Check className="w-4 h-4 text-emerald-400" /> : <Copy className="w-4 h-4 text-amber-400" />}
+                <span>{copiedOriginal ? 'Đã copy' : 'Copy'}</span>
               </button>
+            </div>
+          </div>
+
+          {/* Dedicated Nokia E72 / CorePlayer Stream Section */}
+          <div className="p-4 bg-blue-950/20 border border-blue-500/30 rounded-xl space-y-3">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <div className="w-7 h-7 rounded-lg bg-blue-500/20 border border-blue-500/40 flex items-center justify-center text-blue-400">
+                  <Smartphone className="w-4 h-4" />
+                </div>
+                <div>
+                  <h4 className="text-xs font-bold text-blue-300 uppercase tracking-wide">
+                    Luồng stream chuyên dụng Nokia E72
+                  </h4>
+                  <p className="text-[11px] text-neutral-400">
+                    H.264 Baseline Level 1.2 &bull; QVGA 320x240 &bull; 350 kbps &bull; HTTP thuần
+                  </p>
+                </div>
+              </div>
+              <span className="text-[10px] bg-blue-500/20 text-blue-300 font-mono px-2 py-0.5 rounded border border-blue-500/30">
+                CorePlayer S60
+              </span>
+            </div>
+
+            {/* E72 Stream URL Input */}
+            <div>
+              <label className="text-[11px] font-medium text-neutral-300 block mb-1">
+                URL Luồng MPEG-TS E72 (Dán vào CorePlayer &gt; Open URL):
+              </label>
+              <div className="flex items-center gap-2">
+                <input
+                  type="text"
+                  readOnly
+                  value={e72StreamTsUrl}
+                  className="w-full bg-neutral-950 border border-neutral-800 text-blue-300 text-xs font-mono p-2.5 rounded-lg focus:outline-none selection:bg-blue-950"
+                />
+                <button
+                  type="button"
+                  onClick={handleCopyE72}
+                  className="px-3 py-2.5 bg-neutral-800 hover:bg-neutral-700 text-white rounded-lg text-xs font-medium flex items-center gap-1.5 transition flex-shrink-0 border border-neutral-700"
+                  title="Copy URL luồng E72"
+                >
+                  {copiedE72 ? <Check className="w-4 h-4 text-emerald-400" /> : <Copy className="w-4 h-4 text-blue-400" />}
+                  <span>{copiedE72 ? 'Đã copy' : 'Copy'}</span>
+                </button>
+              </div>
+            </div>
+
+            {/* Quick Action Buttons for E72 */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-1">
+              <a
+                href={e72M3uLauncherUrl}
+                className="p-2.5 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-xs font-semibold flex items-center justify-between transition shadow-md shadow-blue-900/30"
+              >
+                <div className="flex items-center gap-2">
+                  <Zap className="w-4 h-4 fill-current text-amber-300" />
+                  <span>Mở luồng E72 (.M3U 1-Chạm)</span>
+                </div>
+                <ExternalLink className="w-3.5 h-3.5 opacity-80" />
+              </a>
+
+              <a
+                href={e72StreamTsUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="p-2.5 bg-neutral-800 hover:bg-neutral-750 border border-neutral-700 text-neutral-200 rounded-lg text-xs font-medium flex items-center justify-between transition"
+              >
+                <div className="flex items-center gap-2">
+                  <Play className="w-3.5 h-3.5 text-blue-400" />
+                  <span>Phát trực tiếp (.TS 320x240)</span>
+                </div>
+                <ExternalLink className="w-3.5 h-3.5 opacity-70" />
+              </a>
+
+              <a
+                href={e72StreamMp4Url}
+                target="_blank"
+                rel="noreferrer"
+                className="p-2.5 bg-neutral-800 hover:bg-neutral-750 border border-neutral-700 text-neutral-200 rounded-lg text-xs font-medium flex items-center justify-between transition"
+              >
+                <div className="flex items-center gap-2">
+                  <Film className="w-3.5 h-3.5 text-purple-400" />
+                  <span>Phát MP4 (RealPlayer)</span>
+                </div>
+                <ExternalLink className="w-3.5 h-3.5 opacity-70" />
+              </a>
+
+              <a
+                href={`/legacy/channel/${channel.id}`}
+                className="p-2.5 bg-neutral-800 hover:bg-neutral-750 border border-neutral-700 text-neutral-200 rounded-lg text-xs font-medium flex items-center justify-between transition"
+              >
+                <div className="flex items-center gap-2">
+                  <Smartphone className="w-3.5 h-3.5 text-amber-400" />
+                  <span>Xem bản Nokia E72 HTML</span>
+                </div>
+                <ExternalLink className="w-3.5 h-3.5 opacity-70" />
+              </a>
+            </div>
+
+            {/* Specs explanation */}
+            <div className="bg-neutral-900/80 border border-neutral-800/80 rounded-lg p-2.5 text-[11px] text-neutral-300 space-y-1">
+              <div className="font-semibold text-blue-300">
+                Thông số luồng chuyển mã cho Nokia E72:
+              </div>
+              <ul className="list-disc list-inside text-neutral-400 space-y-0.5">
+                <li>Server downscale tự động về <strong>320x240</strong>, CPU E72 chỉ chạy ~35%, không bị tràn RAM.</li>
+                <li>Chuẩn nén <strong>H.264 Baseline Profile Level 1.2</strong>, bitrate <strong>350 kbps</strong>, âm thanh <strong>AAC-LC 64k</strong>.</li>
+                <li>Truyền qua <strong>HTTP thuần</strong>, loại bỏ hoàn toàn lỗi chứng chỉ bảo mật SSL/TLS hết hạn trên S60.</li>
+              </ul>
             </div>
           </div>
 
