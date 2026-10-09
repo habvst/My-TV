@@ -8,6 +8,7 @@ import { M3uImporterModal } from './components/M3uImporterModal';
 import { CategoryScrollNav } from './components/CategoryScrollNav';
 import { AdminPortal } from './components/AdminPortal';
 import { Pagination } from './components/Pagination';
+import { ChannelTrafficChart } from './components/ChannelTrafficChart';
 import {
   Tv,
   Search,
@@ -526,6 +527,9 @@ export default function App() {
                 </a>
               </div>
             </div>
+
+            {/* 7-Day Channel Traffic Trend Chart (Recharts) */}
+            <ChannelTrafficChart />
           </div>
 
           {/* Right Column: Channels Navigation & Grid (Desktop: ~44% width) */}

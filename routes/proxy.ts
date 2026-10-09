@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express';
 import http from 'http';
 import https from 'https';
 import { URL } from 'url';
+import zlib from 'zlib';
 
 const router = Router();
 
@@ -22,7 +23,7 @@ const httpsAgent = new https.Agent({
 });
 
 // Handle preflight CORS requests
-router.options('/api/proxy/stream', (_req: Request, res: Response) => {
+router.options(['/api/proxy/stream', '/api/proxy/stream.m3u8', '/api/proxy/stream/playlist.m3u8'], (_req: Request, res: Response) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
   res.header('Access-Control-Allow-Headers', '*');
@@ -36,7 +37,7 @@ router.options('/api/proxy/stream', (_req: Request, res: Response) => {
  * - Automatically rewrites .m3u8 manifests so that chunklists and .ts segments route through this proxy
  * - Maintains Keep-Alive connections to upstream IPTV servers
  */
-router.get('/api/proxy/stream', async (req: Request, res: Response) => {
+router.get(['/api/proxy/stream', '/api/proxy/stream.m3u8', '/api/proxy/stream/playlist.m3u8'], async (req: Request, res: Response) => {
   const targetUrl = req.query.url as string;
 
   if (!targetUrl || typeof targetUrl !== 'string') {
@@ -118,7 +119,31 @@ router.get('/api/proxy/stream', async (req: Request, res: Response) => {
         const chunks: Buffer[] = [];
         remoteRes.on('data', (chunk) => chunks.push(chunk));
         remoteRes.on('end', () => {
-          const manifestText = Buffer.concat(chunks).toString('utf-8');
+          let buffer = Buffer.concat(chunks);
+          const encoding = (remoteRes.headers['content-encoding'] || '').toLowerCase();
+          const isGzip = encoding === 'gzip' || (buffer.length > 2 && buffer[0] === 0x1f && buffer[1] === 0x8b);
+
+          if (isGzip) {
+            try {
+              buffer = zlib.gunzipSync(buffer);
+            } catch (err: any) {
+              console.warn('[Proxy] Failed to gunzip manifest:', err.message);
+            }
+          } else if (encoding === 'deflate') {
+            try {
+              buffer = zlib.inflateSync(buffer);
+            } catch (err: any) {
+              console.warn('[Proxy] Failed to inflate manifest:', err.message);
+            }
+          } else if (encoding === 'br') {
+            try {
+              buffer = zlib.brotliDecompressSync(buffer);
+            } catch (err: any) {
+              console.warn('[Proxy] Failed to brotli decompress manifest:', err.message);
+            }
+          }
+
+          const manifestText = buffer.toString('utf-8');
 
           if (!manifestText.includes('#EXTM3U')) {
             // Not a real manifest, send as-is
@@ -138,7 +163,9 @@ router.get('/api/proxy/stream', async (req: Request, res: Response) => {
               return trimmed.replace(/URI="([^"]+)"/g, (_match, uriVal) => {
                 try {
                   const resolvedUri = new URL(uriVal, targetUrl).href;
-                  return `URI="/api/proxy/stream?url=${encodeURIComponent(resolvedUri)}"`;
+                  const isSub = resolvedUri.includes('.m3u8');
+                  const prefix = isSub ? '/api/proxy/stream.m3u8' : '/api/proxy/stream';
+                  return `URI="${prefix}?url=${encodeURIComponent(resolvedUri)}"`;
                 } catch {
                   return `URI="${uriVal}"`;
                 }
@@ -153,7 +180,9 @@ router.get('/api/proxy/stream', async (req: Request, res: Response) => {
             // Media URI or sub-manifest URI
             try {
               const resolvedMediaUrl = new URL(trimmed, targetUrl).href;
-              return `/api/proxy/stream?url=${encodeURIComponent(resolvedMediaUrl)}`;
+              const isSub = resolvedMediaUrl.includes('.m3u8');
+              const prefix = isSub ? '/api/proxy/stream.m3u8' : '/api/proxy/stream';
+              return `${prefix}?url=${encodeURIComponent(resolvedMediaUrl)}`;
             } catch {
               return line;
             }

@@ -50,8 +50,10 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
   // Calculate actual playback URL
   const getStreamSource = useCallback(
     (streamUrl: string, proxyEnabled: boolean): string => {
+      const isM3u = streamUrl.includes('.m3u8') || streamUrl.includes('mpegurl');
+      const prefix = isM3u ? '/api/proxy/stream.m3u8' : '/api/proxy/stream';
       if (proxyEnabled) {
-        return `/api/proxy/stream?url=${encodeURIComponent(streamUrl)}`;
+        return `${prefix}?url=${encodeURIComponent(streamUrl)}`;
       }
       // Force proxy only if mixed-content (HTTP on HTTPS page)
       if (
@@ -59,7 +61,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
         window.location.protocol === 'https:' &&
         streamUrl.startsWith('http:')
       ) {
-        return `/api/proxy/stream?url=${encodeURIComponent(streamUrl)}`;
+        return `${prefix}?url=${encodeURIComponent(streamUrl)}`;
       }
       return streamUrl;
     },
@@ -113,44 +115,8 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
         return;
       }
 
-      // 1. Native HLS support (Safari iOS / macOS)
-      if (isHls && video.canPlayType('application/vnd.apple.mpegurl')) {
-        video.src = effectiveSource;
-        video
-          .play()
-          .then(() => {
-            setIsPlaying(true);
-            setIsLoading(false);
-            setAutoplayMuted(false);
-          })
-          .catch((err) => {
-            console.warn('Native playback error or unmuted autoplay blocked:', err);
-            video.muted = true;
-            setIsMuted(true);
-            video
-              .play()
-              .then(() => {
-                setIsPlaying(true);
-                setIsLoading(false);
-                setAutoplayMuted(true);
-              })
-              .catch(() => {
-                if (!proxyMode) {
-                  cleanupMedia();
-                  setUseProxy(true);
-                  setTimeout(() => startPlayback(true), 100);
-                } else {
-                  cleanupMedia();
-                  setIsLoading(false);
-                  setHasError(true);
-                  setErrorMessage('Trình duyệt không thể phát luồng này trực tiếp.');
-                }
-              });
-          });
-        return;
-      }
-
-      // 2. HLS.js for Chrome, Firefox, Edge, Android
+      // 1. PRIMARY ENGINE: HLS.js with MediaSource Extensions
+      // Must be evaluated first for Chrome, Edge, Firefox, Opera, and Safari Desktop!
       if (isHls && Hls.isSupported()) {
         const hls = new Hls({
           enableWorker: true,
@@ -248,7 +214,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
                   cleanupMedia();
                   setHasError(true);
                   setErrorMessage(
-                    'Không thể kết nối đến máy chủ IPTV (Server nguồn có thể đang bảo trì, đổi link hoặc chặn kết nối).'
+                    'Không thể kết nối đến máy chủ IPTV (Server nguồn có thể đang chặn kết nối hoặc quá tải).'
                   );
                   setIsLoading(false);
                 }
@@ -280,6 +246,43 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
               break;
           }
         });
+        return;
+      }
+
+      // 2. SECONDARY FALLBACK: Native HLS (specifically iOS Safari where MSE is not supported)
+      if (isHls && video.canPlayType('application/vnd.apple.mpegurl')) {
+        video.src = effectiveSource;
+        video
+          .play()
+          .then(() => {
+            setIsPlaying(true);
+            setIsLoading(false);
+            setAutoplayMuted(false);
+          })
+          .catch((err) => {
+            console.warn('Native playback error or unmuted autoplay blocked:', err);
+            video.muted = true;
+            setIsMuted(true);
+            video
+              .play()
+              .then(() => {
+                setIsPlaying(true);
+                setIsLoading(false);
+                setAutoplayMuted(true);
+              })
+              .catch(() => {
+                if (!proxyMode) {
+                  cleanupMedia();
+                  setUseProxy(true);
+                  setTimeout(() => startPlayback(true), 100);
+                } else {
+                  cleanupMedia();
+                  setIsLoading(false);
+                  setHasError(true);
+                  setErrorMessage('Trình duyệt không thể phát luồng này trực tiếp.');
+                }
+              });
+          });
         return;
       }
 
@@ -467,6 +470,44 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
     }, 50);
   };
 
+  const handlePlayServerGateway = () => {
+    if (!channel) return;
+    cleanupMedia();
+    setHasError(false);
+    setIsLoading(true);
+    setErrorMessage('');
+    const video = videoRef.current;
+    if (!video) return;
+
+    // Use direct progressive MP4 transcoded stream from server gateway
+    const gatewayUrl = `/e72/stream/${encodeURIComponent(channel.id)}.mp4`;
+    video.src = gatewayUrl;
+    video
+      .play()
+      .then(() => {
+        setIsPlaying(true);
+        setIsLoading(false);
+        setAutoplayMuted(false);
+      })
+      .catch(() => {
+        video.muted = true;
+        setIsMuted(true);
+        video
+          .play()
+          .then(() => {
+            setIsPlaying(true);
+            setIsLoading(false);
+            setAutoplayMuted(true);
+          })
+          .catch((err) => {
+            console.error('Server gateway playback failed:', err);
+            setHasError(true);
+            setErrorMessage('Máy chủ không thể chuyển mã luồng phát này.');
+            setIsLoading(false);
+          });
+      });
+  };
+
   const handleCopy = () => {
     if (!channel) return;
     navigator.clipboard.writeText(channel.stream_url);
@@ -605,6 +646,17 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
                   Thử lại Proxy
                 </button>
               )}
+
+              {/* Server-Side Transcoded Fallback Button */}
+              <button
+                type="button"
+                onClick={handlePlayServerGateway}
+                className="px-3.5 py-2 bg-blue-600 hover:bg-blue-500 text-white font-bold rounded-lg text-xs flex items-center gap-1.5 transition shadow-md shadow-blue-600/20"
+                title="Sử dụng máy chủ chuyển mã luồng thành MP4 trực tiếp cho trình duyệt"
+              >
+                <Zap className="w-4 h-4 fill-current text-amber-300" />
+                Phát qua Gateway Server (MP4)
+              </button>
 
               <button
                 type="button"

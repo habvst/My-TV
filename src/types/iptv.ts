@@ -61,3 +61,19 @@ export interface AdminStats {
   activeChannels: number;
   groups: string[];
 }
+
+export interface DailyTrafficPoint {
+  date: string;
+  fullDate: string;
+  dayName: string;
+  views: number;
+  channels: number;
+}
+
+export interface ChannelTrafficStats {
+  daily: DailyTrafficPoint[];
+  total7dViews: number;
+  todayViews: number;
+  growthPercent: number;
+  topChannels: Array<{ id: string; name: string; views: number; group: string }>;
+}

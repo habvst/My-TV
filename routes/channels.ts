@@ -5,6 +5,7 @@ import {
   getAllActiveChannels,
   getChannelById as getChannelFromDb,
   recordChannelClick,
+  getTrafficStats,
 } from '../src/db/storage.js';
 
 const router = Router();
@@ -96,6 +97,16 @@ router.get('/api/channels', async (req: Request, res: Response) => {
       totalPages,
       channels: paginated,
     });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// API: Get 7-day traffic stats & trends for dashboard
+router.get('/api/stats', async (_req: Request, res: Response) => {
+  try {
+    const stats = await getTrafficStats();
+    res.json(stats);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
