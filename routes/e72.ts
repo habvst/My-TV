@@ -9,6 +9,38 @@ const router = Router();
 const activeTranscodingSessions = new Map<string, { pid: number; channelId: string; startTime: number; clientIp: string; process: ChildProcess }>();
 
 /**
+ * Robust channel resolver:
+ * - Strips media extensions (.mp4, .ts, .m3u, .ram) case-insensitively
+ * - Decodes URL components
+ * - Performs case-insensitive fallback search
+ */
+async function resolveChannel(rawInput: string): Promise<any | null> {
+  if (!rawInput) return null;
+  let clean = decodeURIComponent(rawInput).trim();
+  clean = clean.replace(/\.(mp4|ts|m3u|ram)$/i, '');
+
+  let channel = await getChannelById(clean);
+  if (!channel && clean !== rawInput) {
+    channel = await getChannelById(rawInput);
+  }
+  if (!channel) {
+    const all = await getAllChannels();
+    channel = all.find(c => c.id.toLowerCase() === clean.toLowerCase() || c.id.toLowerCase() === rawInput.toLowerCase()) || null;
+  }
+  return channel;
+}
+
+// OPTIONS preflight for streaming endpoints
+router.options(['/e72/stream/:id.:ext', '/e72/stream/:id', '/e72/play/:id.:ext', '/e72/play/:id'], (_req: Request, res: Response) => {
+  res.writeHead(200, {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
+    'Access-Control-Allow-Headers': '*',
+  });
+  res.end();
+});
+
+/**
  * Endpoint /e72/stream/:id or /e72/stream/:id.:ext (e.g. .ts or .mp4)
  * Dedicated real-time transcoding gateway for Nokia E72 / Symbian S60v3
  * - Supports both MPEG-TS (MIME video/MP2T) and Fragmented MP4 (MIME video/mp4)
@@ -18,26 +50,14 @@ const activeTranscodingSessions = new Map<string, { pid: number; channelId: stri
  * - Converts audio to AAC-LC 64 kbps, 44.1 kHz stereo
  * - Serves over plain HTTP with inline Content-Disposition for 1-Touch opening
  */
-router.get(['/e72/stream/:id.:ext', '/e72/stream/:id'], async (req: Request, res: Response) => {
-  let channelId = req.params.id;
+router.all(['/e72/stream/:id.:ext', '/e72/stream/:id'], async (req: Request, res: Response) => {
+  const rawId = req.params.id || '';
   const extParam = (req.params.ext || '').toLowerCase();
-  const formatQuery = (req.query.format as string || '').toLowerCase();
+  const formatQuery = (req.query.format as string || req.query.type as string || '').toLowerCase();
 
-  let isMp4 = extParam === 'mp4' || formatQuery === 'mp4';
+  const isMp4 = extParam === 'mp4' || formatQuery === 'mp4' || /\.mp4$/i.test(rawId);
 
-  // Handle case where Express matched extension as part of :id (e.g. 'cantho1.mp4' or 'cantho1.ts')
-  if (channelId.endsWith('.mp4')) {
-    channelId = channelId.slice(0, -4);
-    isMp4 = true;
-  } else if (channelId.endsWith('.ts')) {
-    channelId = channelId.slice(0, -3);
-  }
-
-  // Lookup channel by sanitized id first, then fallback to original id
-  let channel = await getChannelById(channelId);
-  if (!channel && channelId !== req.params.id) {
-    channel = await getChannelById(req.params.id);
-  }
+  const channel = await resolveChannel(rawId);
 
   if (!channel) {
     return res.status(404).send('Kênh không tồn tại');
@@ -45,7 +65,6 @@ router.get(['/e72/stream/:id.:ext', '/e72/stream/:id'], async (req: Request, res
 
   const clientIp = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress || 'unknown';
   const sessionId = `${channel.id}-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
-  console.log(`[E72 Transcode] Starting ${isMp4 ? 'MP4' : 'MPEG-TS'} stream for "${channel.name}" (${channel.id}) to ${clientIp} [Session: ${sessionId}]`);
 
   // Record click / view asynchronously
   recordChannelClick(channel.id).catch(() => {});
@@ -54,6 +73,33 @@ router.get(['/e72/stream/:id.:ext', '/e72/stream/:id'], async (req: Request, res
   const contentType = isMp4 ? 'video/mp4' : 'video/MP2T';
   const safeId = channel.id.replace(/[^\w-]/g, '_');
   const fileName = `${safeId}_e72.${isMp4 ? 'mp4' : 'ts'}`;
+
+  // HEAD request support: Return headers immediately without spawning FFmpeg
+  if (req.method === 'HEAD') {
+    res.writeHead(200, {
+      'Content-Type': contentType,
+      'Content-Disposition': `inline; filename="${fileName}"`,
+      'Cache-Control': 'no-cache, no-store, must-revalidate',
+      'Pragma': 'no-cache',
+      'Expires': '0',
+      'Connection': 'close',
+      'Access-Control-Allow-Origin': '*',
+      'Accept-Ranges': 'none',
+    });
+    return res.end();
+  }
+
+  // Pre-cleanup: Clean up older active sessions from the same client to prevent resource exhaustion
+  for (const [sid, info] of activeTranscodingSessions.entries()) {
+    if (info.clientIp === clientIp && info.channelId === channel.id) {
+      try {
+        info.process.kill('SIGKILL');
+      } catch {}
+      activeTranscodingSessions.delete(sid);
+    }
+  }
+
+  console.log(`[E72 Transcode] Starting ${isMp4 ? 'MP4' : 'MPEG-TS'} stream for "${channel.name}" (${channel.id}) to ${clientIp} [Session: ${sessionId}]`);
 
   res.writeHead(200, {
     'Content-Type': contentType,
@@ -187,7 +233,7 @@ router.get(['/e72/stream/:id.:ext', '/e72/stream/:id'], async (req: Request, res
  * - ?type=coreplayer: Redirects to coreplayer:// scheme.
  */
 router.get(['/e72/play/:id.:ext', '/e72/play/:id'], async (req: Request, res: Response) => {
-  let channelId = req.params.id;
+  let channelId = req.params.id || '';
   const extParam = (req.params.ext || '').toLowerCase();
   let type = ((req.query.type as string) || (req.query.format as string) || extParam || '').toLowerCase();
 
@@ -207,9 +253,9 @@ router.get(['/e72/play/:id.:ext', '/e72/play/:id'], async (req: Request, res: Re
 
   if (!type) type = 'm3u';
 
-  let channel = await getChannelById(channelId);
+  let channel = await resolveChannel(channelId);
   if (!channel && channelId !== req.params.id) {
-    channel = await getChannelById(req.params.id);
+    channel = await resolveChannel(req.params.id);
   }
 
   if (!channel) {
@@ -259,14 +305,14 @@ ${streamUrl}
  * Single-channel M3U playlist file for Nokia E72 CorePlayer one-click opening
  */
 router.get(['/e72/channel/:id.m3u', '/e72/channel/:id'], async (req: Request, res: Response) => {
-  let channelId = req.params.id;
+  let channelId = req.params.id || '';
   if (channelId.endsWith('.m3u')) {
     channelId = channelId.slice(0, -4);
   }
 
-  let channel = await getChannelById(channelId);
+  let channel = await resolveChannel(channelId);
   if (!channel && channelId !== req.params.id) {
-    channel = await getChannelById(req.params.id);
+    channel = await resolveChannel(req.params.id);
   }
 
   if (!channel) {

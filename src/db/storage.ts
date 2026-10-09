@@ -487,16 +487,51 @@ export async function getAllChannelsAdmin(): Promise<Channel[]> {
 }
 
 export async function getChannelById(id: string): Promise<Channel | null> {
+  if (!id) return null;
+
+  // Clean and normalize incoming ID
+  let cleanId = id.trim();
+  try {
+    cleanId = decodeURIComponent(cleanId);
+  } catch {
+    // ignore decode error
+  }
+  // Strip media file extensions if client appended them
+  const strippedId = cleanId.replace(/\.(mp4|ts|m3u|ram|m3u8)$/i, '').trim();
+
   let channel: Channel | null = null;
   if (pool) {
     try {
-      const res = await pool.query('SELECT * FROM channels WHERE id = $1', [id]);
+      const res = await pool.query(
+        'SELECT * FROM channels WHERE id = $1 OR id = $2 OR LOWER(id) = LOWER($1) OR LOWER(id) = LOWER($2) LIMIT 1',
+        [id, strippedId]
+      );
       channel = res.rows[0] || null;
     } catch (err) {
       console.error('[Storage] Postgres getChannelById error:', err);
     }
   } else {
-    channel = channelsCache.find((c) => c.id === id) || null;
+    // 1. Exact match
+    channel = channelsCache.find((c) => c.id === id || c.id === strippedId) || null;
+
+    // 2. Case-insensitive ID match
+    if (!channel) {
+      const lowerA = id.toLowerCase();
+      const lowerB = strippedId.toLowerCase();
+      channel = channelsCache.find((c) => c.id.toLowerCase() === lowerA || c.id.toLowerCase() === lowerB) || null;
+    }
+
+    // 3. Fallback: match by tvg_id
+    if (!channel && strippedId) {
+      const lowerB = strippedId.toLowerCase();
+      channel = channelsCache.find((c) => c.tvg_id && c.tvg_id.toLowerCase() === lowerB) || null;
+    }
+
+    // 4. Fallback: match by name
+    if (!channel && strippedId) {
+      const lowerB = strippedId.toLowerCase();
+      channel = channelsCache.find((c) => c.name && c.name.toLowerCase() === lowerB) || null;
+    }
   }
 
   if (channel) {
