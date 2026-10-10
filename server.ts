@@ -18,8 +18,10 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-const PORT = (process.env.PORT && process.env.PORT !== '8080') ? parseInt(process.env.PORT, 10) : 3000;
 const isProd = process.env.NODE_ENV === 'production';
+const PORT = isProd
+  ? (process.env.PORT ? parseInt(process.env.PORT, 10) : 3000)
+  : ((process.env.PORT && process.env.PORT !== '8080') ? parseInt(process.env.PORT, 10) : 3000);
 
 // Helper to parse cookie string
 function parseCookies(cookieHeader: string = ''): Record<string, string> {
