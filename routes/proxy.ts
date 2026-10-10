@@ -88,7 +88,7 @@ router.get(['/api/proxy/stream', '/api/proxy/stream.m3u8', '/api/proxy/stream/pl
       method: req.method === 'HEAD' ? 'HEAD' : 'GET',
       headers: requestHeaders,
       agent,
-      timeout: 30000, // 30 seconds socket timeout to accommodate slower IPTV CDNs
+      timeout: 10000, // 10 seconds socket timeout to quickly fail dead streams
       rejectUnauthorized: false,
     };
 

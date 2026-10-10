@@ -1,11 +1,12 @@
 import React from 'react';
 import { Channel } from '../types/iptv';
-import { Play, Star, Info, ExternalLink, Flame } from 'lucide-react';
+import { Play, Star, Info, ExternalLink, Flame, AlertCircle } from 'lucide-react';
 
 interface ChannelCardProps {
   channel: Channel;
   isActive: boolean;
   isFavorite: boolean;
+  isBroken?: boolean;
   onSelect: (channel: Channel) => void;
   onPlay?: (channel: Channel, e: React.MouseEvent) => void;
   onToggleFavorite: (channelId: string, e: React.MouseEvent) => void;
@@ -16,6 +17,7 @@ export const ChannelCard: React.FC<ChannelCardProps> = ({
   channel,
   isActive,
   isFavorite,
+  isBroken = false,
   onSelect,
   onPlay,
   onToggleFavorite,
@@ -74,6 +76,15 @@ export const ChannelCard: React.FC<ChannelCardProps> = ({
               <span className="text-[10px] font-bold text-emerald-400 bg-emerald-500/15 border border-emerald-500/30 px-1.5 py-0.5 rounded flex items-center gap-1 animate-pulse">
                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
                 Đang phát
+              </span>
+            )}
+            {isBroken && !isActive && (
+              <span
+                className="text-[10px] font-bold text-rose-400 bg-rose-500/15 border border-rose-500/30 px-1.5 py-0.5 rounded flex items-center gap-0.5"
+                title="Kênh này hiện đang phản hồi chậm hoặc tạm gián đoạn nguồn"
+              >
+                <AlertCircle className="w-2.5 h-2.5 text-rose-400" />
+                Gián đoạn
               </span>
             )}
           </div>

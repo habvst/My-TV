@@ -52,6 +52,7 @@ export default function App() {
   // Local user state
   const [favorites, setFavorites] = useState<string[]>([]);
   const [recentIds, setRecentIds] = useState<string[]>([]);
+  const [brokenChannelIds, setBrokenChannelIds] = useState<string[]>([]);
   const [deviceInfo, setDeviceInfo] = useState<DeviceInfo | null>(null);
 
   // Stable refs to prevent loadChannels recreation when channel or favorites change
@@ -280,6 +281,26 @@ export default function App() {
     });
   };
 
+  // Next and Previous Channel navigation
+  const handleNextChannel = useCallback(() => {
+    if (!channels || channels.length === 0 || !selectedChannel) return;
+    const currentIndex = channels.findIndex((c) => c.id === selectedChannel.id);
+    const nextIndex = currentIndex >= 0 ? (currentIndex + 1) % channels.length : 0;
+    handleSelectChannel(channels[nextIndex]);
+  }, [channels, selectedChannel]);
+
+  const handlePreviousChannel = useCallback(() => {
+    if (!channels || channels.length === 0 || !selectedChannel) return;
+    const currentIndex = channels.findIndex((c) => c.id === selectedChannel.id);
+    const prevIndex = currentIndex > 0 ? currentIndex - 1 : channels.length - 1;
+    handleSelectChannel(channels[prevIndex]);
+  }, [channels, selectedChannel]);
+
+  // Mark channel as broken/offline in current session
+  const handleChannelError = useCallback((channel: Channel) => {
+    setBrokenChannelIds((prev) => (prev.includes(channel.id) ? prev : [...prev, channel.id]));
+  }, []);
+
   // Toggle favorite
   const handleToggleFavorite = (channelId: string, e: React.MouseEvent) => {
     e.stopPropagation();
@@ -474,6 +495,9 @@ export default function App() {
               channel={selectedChannel}
               playTrigger={playTrigger}
               onOpenDetails={(ch) => handleOpenDetails(ch)}
+              onNextChannel={handleNextChannel}
+              onPreviousChannel={handlePreviousChannel}
+              onChannelError={handleChannelError}
             />
 
             {/* Quick Hub: CorePlayer on Nokia E72 Banner */}
@@ -767,6 +791,7 @@ export default function App() {
                         channel={channel}
                         isActive={selectedChannel?.id === channel.id}
                         isFavorite={favorites.includes(channel.id)}
+                        isBroken={brokenChannelIds.includes(channel.id)}
                         onSelect={handleSelectChannel}
                         onPlay={handleSelectChannel}
                         onToggleFavorite={handleToggleFavorite}
