@@ -21,10 +21,12 @@ import {
   Flame,
   Clock,
   ArrowUpDown,
+  FastForward,
 } from 'lucide-react';
 
 const STORAGE_FAVORITES_KEY = 'my_iptv_favorites_v1';
 const STORAGE_RECENT_KEY = 'my_iptv_recent_v1';
+const STORAGE_AUTO_SKIP_KEY = 'my_iptv_auto_skip_error_v1';
 
 export default function App() {
   const [viewMode, setViewMode] = useState<'app' | 'admin'>(() => {
@@ -53,6 +55,14 @@ export default function App() {
   const [favorites, setFavorites] = useState<string[]>([]);
   const [recentIds, setRecentIds] = useState<string[]>([]);
   const [brokenChannelIds, setBrokenChannelIds] = useState<string[]>([]);
+  const [autoSkipOnError, setAutoSkipOnError] = useState<boolean>(() => {
+    try {
+      const saved = localStorage.getItem(STORAGE_AUTO_SKIP_KEY);
+      return saved !== null ? JSON.parse(saved) : true; // Default to true as requested!
+    } catch {
+      return true;
+    }
+  });
   const [deviceInfo, setDeviceInfo] = useState<DeviceInfo | null>(null);
 
   // Stable refs to prevent loadChannels recreation when channel or favorites change
@@ -80,6 +90,17 @@ export default function App() {
     window.addEventListener('popstate', handlePopState);
     return () => window.removeEventListener('popstate', handlePopState);
   }, []);
+
+  // Boundary check in current channel list across all pages
+  const selectedChannelIndex = channels && selectedChannel
+    ? channels.findIndex((c) => c.id === selectedChannel.id)
+    : -1;
+  const isLastChannel = Boolean(
+    channels &&
+      channels.length > 0 &&
+      selectedChannelIndex >= channels.length - 1 &&
+      currentPage >= totalPages
+  );
 
   // Load favorites & recent from localStorage
   useEffect(() => {
@@ -189,8 +210,9 @@ export default function App() {
             if (paginated.length > 0 && !selectedChannelRef.current) {
               setSelectedChannel(paginated[0]);
             }
+            return paginated;
           }
-          return;
+          return [];
         }
 
         // Standard server-side filtering, sorting & search (60 channels per page)
@@ -220,9 +242,12 @@ export default function App() {
           if (!selectedChannelRef.current && newChannels.length > 0) {
             setSelectedChannel(newChannels[0]);
           }
+          return newChannels;
         }
+        return [];
       } catch (err) {
         console.error('Error loading channels:', err);
+        return [];
       } finally {
         setLoading(false);
       }
@@ -281,24 +306,85 @@ export default function App() {
     });
   };
 
-  // Next and Previous Channel navigation
-  const handleNextChannel = useCallback(() => {
-    if (!channels || channels.length === 0 || !selectedChannel) return;
-    const currentIndex = channels.findIndex((c) => c.id === selectedChannel.id);
-    const nextIndex = currentIndex >= 0 ? (currentIndex + 1) % channels.length : 0;
-    handleSelectChannel(channels[nextIndex]);
-  }, [channels, selectedChannel]);
+  // Next and Previous Channel navigation with seamless cross-page progression
+  const handleNextChannel = useCallback(
+    async (isAutoSkip = false) => {
+      if (!channels || channels.length === 0 || !selectedChannel) return;
+      const currentIndex = channels.findIndex((c) => c.id === selectedChannel.id);
+      if (currentIndex >= 0 && currentIndex < channels.length - 1) {
+        // Move to the next channel in the current page
+        handleSelectChannel(channels[currentIndex + 1]);
+      } else if (currentPage < totalPages) {
+        // At the bottom of the current page, but next page exists:
+        // Automatically load next page and pick first channel on that page!
+        const nextPage = currentPage + 1;
+        setCurrentPage(nextPage);
+        const nextPageChannels = await loadChannels(activeGroup, debouncedQuery, nextPage, sortOption);
+        if (nextPageChannels && nextPageChannels.length > 0) {
+          handleSelectChannel(nextPageChannels[0]);
+        }
+      } else if (!isAutoSkip && channels.length > 0) {
+        // Manual click on last channel wraps around to page 1, channel 0
+        if (currentPage !== 1) {
+          setCurrentPage(1);
+          const p1Channels = await loadChannels(activeGroup, debouncedQuery, 1, sortOption);
+          if (p1Channels && p1Channels.length > 0) {
+            handleSelectChannel(p1Channels[0]);
+          }
+        } else {
+          handleSelectChannel(channels[0]);
+        }
+      }
+    },
+    [channels, selectedChannel, currentPage, totalPages, activeGroup, debouncedQuery, sortOption, loadChannels]
+  );
 
-  const handlePreviousChannel = useCallback(() => {
-    if (!channels || channels.length === 0 || !selectedChannel) return;
-    const currentIndex = channels.findIndex((c) => c.id === selectedChannel.id);
-    const prevIndex = currentIndex > 0 ? currentIndex - 1 : channels.length - 1;
-    handleSelectChannel(channels[prevIndex]);
-  }, [channels, selectedChannel]);
+  const handlePreviousChannel = useCallback(
+    async () => {
+      if (!channels || channels.length === 0 || !selectedChannel) return;
+      const currentIndex = channels.findIndex((c) => c.id === selectedChannel.id);
+      if (currentIndex > 0) {
+        handleSelectChannel(channels[currentIndex - 1]);
+      } else if (currentPage > 1) {
+        // Load previous page and pick the last channel on that page
+        const prevPage = currentPage - 1;
+        setCurrentPage(prevPage);
+        const prevPageChannels = await loadChannels(activeGroup, debouncedQuery, prevPage, sortOption);
+        if (prevPageChannels && prevPageChannels.length > 0) {
+          handleSelectChannel(prevPageChannels[prevPageChannels.length - 1]);
+        }
+      } else {
+        // Wrap around to the very last page
+        if (totalPages > 1) {
+          setCurrentPage(totalPages);
+          const lastPageChannels = await loadChannels(activeGroup, debouncedQuery, totalPages, sortOption);
+          if (lastPageChannels && lastPageChannels.length > 0) {
+            handleSelectChannel(lastPageChannels[lastPageChannels.length - 1]);
+          }
+        } else {
+          handleSelectChannel(channels[channels.length - 1]);
+        }
+      }
+    },
+    [channels, selectedChannel, currentPage, totalPages, activeGroup, debouncedQuery, sortOption, loadChannels]
+  );
 
   // Mark channel as broken/offline in current session
   const handleChannelError = useCallback((channel: Channel) => {
     setBrokenChannelIds((prev) => (prev.includes(channel.id) ? prev : [...prev, channel.id]));
+  }, []);
+
+  // Toggle Auto-skip on error preference
+  const handleToggleAutoSkip = useCallback(() => {
+    setAutoSkipOnError((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem(STORAGE_AUTO_SKIP_KEY, JSON.stringify(next));
+      } catch (err) {
+        console.warn('LocalStorage error:', err);
+      }
+      return next;
+    });
   }, []);
 
   // Toggle favorite
@@ -483,6 +569,21 @@ export default function App() {
             >
               Hiện đại
             </a>
+
+            {/* Auto-Skip broken channels toggle */}
+            <button
+              type="button"
+              onClick={handleToggleAutoSkip}
+              className={`px-2.5 py-1 rounded text-[11px] font-semibold transition flex items-center gap-1.5 cursor-pointer border ${
+                autoSkipOnError
+                  ? 'bg-amber-500/15 text-amber-300 border-amber-500/40 hover:bg-amber-500/25'
+                  : 'bg-neutral-800 text-neutral-400 border-neutral-700 hover:text-white'
+              }`}
+              title="Tự động chuyển sang kênh kế tiếp nếu kênh hiện tại bị lỗi nguồn"
+            >
+              <FastForward className={`w-3.5 h-3.5 ${autoSkipOnError ? 'text-amber-400' : 'text-neutral-500'}`} />
+              <span>Tự chuyển khi lỗi: <strong className={autoSkipOnError ? 'text-amber-300 font-bold' : 'text-neutral-400'}>{autoSkipOnError ? 'BẬT' : 'TẮT'}</strong></span>
+            </button>
           </div>
         </div>
 
@@ -498,6 +599,11 @@ export default function App() {
               onNextChannel={handleNextChannel}
               onPreviousChannel={handlePreviousChannel}
               onChannelError={handleChannelError}
+              autoSkipOnError={autoSkipOnError}
+              onToggleAutoSkip={handleToggleAutoSkip}
+              isLastChannel={isLastChannel}
+              currentChannelIndex={selectedChannelIndex >= 0 ? (currentPage - 1) * 60 + selectedChannelIndex + 1 : 1}
+              totalChannelsInList={totalMatching > 0 ? totalMatching : channels.length}
             />
 
             {/* Quick Hub: CorePlayer on Nokia E72 Banner */}

@@ -16,16 +16,24 @@ import {
   SkipForward,
   SkipBack,
   WifiOff,
-  AlertTriangle
+  AlertTriangle,
+  FastForward,
+  CheckCircle2,
+  RotateCcw
 } from 'lucide-react';
 
 interface VideoPlayerProps {
   channel: Channel | null;
   playTrigger?: number;
   onOpenDetails?: (channel: Channel) => void;
-  onNextChannel?: () => void;
+  onNextChannel?: (isAutoSkip?: boolean) => void;
   onPreviousChannel?: () => void;
   onChannelError?: (channel: Channel, errorType?: string) => void;
+  autoSkipOnError?: boolean;
+  onToggleAutoSkip?: () => void;
+  isLastChannel?: boolean;
+  currentChannelIndex?: number;
+  totalChannelsInList?: number;
 }
 
 export const VideoPlayer: React.FC<VideoPlayerProps> = ({
@@ -35,6 +43,11 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
   onNextChannel,
   onPreviousChannel,
   onChannelError,
+  autoSkipOnError = true,
+  onToggleAutoSkip,
+  isLastChannel = false,
+  currentChannelIndex,
+  totalChannelsInList,
 }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const hlsRef = useRef<Hls | null>(null);
@@ -45,6 +58,12 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
   const watchdogTimerRef = useRef<NodeJS.Timeout | null>(null);
   const loadingTickerRef = useRef<NodeJS.Timeout | null>(null);
   const lastToggleTimeRef = useRef<number>(0);
+
+  // Auto-skip Countdown timer
+  const autoSkipTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const [autoSkipCountdown, setAutoSkipCountdown] = useState<number | null>(null);
+  const [consecutiveSkippedCount, setConsecutiveSkippedCount] = useState<number>(0);
+  const [showRecoveredToast, setShowRecoveredToast] = useState<boolean>(false);
 
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
   const [isMuted, setIsMuted] = useState<boolean>(false);
@@ -99,6 +118,15 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
     }
   }, []);
 
+  // Clear auto-skip timer
+  const clearAutoSkipTimer = useCallback(() => {
+    if (autoSkipTimerRef.current) {
+      clearTimeout(autoSkipTimerRef.current);
+      autoSkipTimerRef.current = null;
+    }
+    setAutoSkipCountdown(null);
+  }, []);
+
   // Stop and clean up HLS and video element
   const cleanupMedia = useCallback(() => {
     clearWatchdogs();
@@ -123,11 +151,93 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
     }
   }, [clearWatchdogs]);
 
+  // Centralized Error Trigger with Auto-Skip: continues until active channel is found or bottom is reached
+  const triggerErrorState = useCallback(
+    (type: 'TIMEOUT' | 'OFFLINE' | 'DECODE' | 'UNKNOWN', message: string) => {
+      clearWatchdogs();
+      cleanupMedia();
+      setIsLoading(false);
+      setHasError(true);
+      setErrorType(type);
+      setErrorMessage(message);
+
+      if (channel) {
+        onChannelError?.(channel, type);
+      }
+
+      // If auto-skip is enabled and not already at the bottom of the list:
+      if (autoSkipOnError && onNextChannel) {
+        if (isLastChannel) {
+          // Reached the bottom of the current list: halt auto-skipping
+          clearAutoSkipTimer();
+        } else {
+          setConsecutiveSkippedCount((prev) => prev + 1);
+          // Fast 2-second countdown to hop to next channel
+          setAutoSkipCountdown(2);
+        }
+      } else {
+        clearAutoSkipTimer();
+      }
+    },
+    [channel, onChannelError, autoSkipOnError, onNextChannel, isLastChannel, clearWatchdogs, cleanupMedia, clearAutoSkipTimer]
+  );
+
+  // Auto-skip countdown ticker: when countdown reaches 0, trigger onNextChannel(true)
+  useEffect(() => {
+    if (autoSkipCountdown === null) {
+      if (autoSkipTimerRef.current) {
+        clearTimeout(autoSkipTimerRef.current);
+        autoSkipTimerRef.current = null;
+      }
+      return;
+    }
+
+    if (autoSkipCountdown <= 0) {
+      setAutoSkipCountdown(null);
+      if (!isLastChannel) {
+        onNextChannel?.(true); // isAutoSkip = true
+      }
+      return;
+    }
+
+    autoSkipTimerRef.current = setTimeout(() => {
+      setAutoSkipCountdown((prev) => (prev !== null && prev > 0 ? prev - 1 : null));
+    }, 1000);
+
+    return () => {
+      if (autoSkipTimerRef.current) {
+        clearTimeout(autoSkipTimerRef.current);
+      }
+    };
+  }, [autoSkipCountdown, onNextChannel, isLastChannel]);
+
+  // If user disables auto-skip while counting down, cancel immediately
+  useEffect(() => {
+    if (!autoSkipOnError) {
+      clearAutoSkipTimer();
+    }
+  }, [autoSkipOnError, clearAutoSkipTimer]);
+
+  const handleCancelAutoSkip = (e?: React.MouseEvent) => {
+    if (e) e.stopPropagation();
+    clearAutoSkipTimer();
+    setConsecutiveSkippedCount(0);
+  };
+
+  const handleSkipNow = (e?: React.MouseEvent) => {
+    if (e) e.stopPropagation();
+    clearAutoSkipTimer();
+    if (!isLastChannel) {
+      onNextChannel?.(true);
+    }
+  };
+
   // Load and play stream with watchdog protection
   const startPlayback = useCallback(
     (proxyMode: boolean) => {
       if (!channel) return;
       cleanupMedia();
+      clearAutoSkipTimer();
 
       setHasError(false);
       setErrorMessage('');
@@ -185,23 +295,26 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
       watchdogTimerRef.current = setTimeout(() => {
         if (autoProxyTimer) clearTimeout(autoProxyTimer);
         console.warn(`[Watchdog Timeout] Stream not responding after 8s for channel: ${channel.name}`);
-        clearWatchdogs();
-        cleanupMedia();
-        setIsLoading(false);
-        setHasError(true);
-        setErrorType('TIMEOUT');
-        setErrorMessage(
+        triggerErrorState(
+          'TIMEOUT',
           'Thời gian kết nối vượt quá 8 giây. Máy chủ nguồn IPTV này hiện đang ngoại tuyến, băng thông bị nghẽn hoặc chặn IP.'
         );
-        onChannelError?.(channel, 'TIMEOUT');
       }, 8000);
 
-      // Helper to mark playback successfully started
+      // Helper to mark playback successfully started (active working stream found!)
       const onStreamSuccess = () => {
         if (autoProxyTimer) clearTimeout(autoProxyTimer);
         clearWatchdogs();
+        clearAutoSkipTimer();
         setIsLoading(false);
         setHasError(false);
+        setConsecutiveSkippedCount((prev) => {
+          if (prev > 0) {
+            setShowRecoveredToast(true);
+            setTimeout(() => setShowRecoveredToast(false), 4500);
+          }
+          return 0;
+        });
       };
 
       // -------------------------------------------------------------
@@ -217,7 +330,6 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
           liveSyncDurationCount: 3,
           liveMaxLatencyDurationCount: 8,
           liveDurationInfinity: true,
-          // Aggressive IPTV timeouts: fast fail rather than hanging for minutes
           manifestLoadingTimeOut: 4500,
           manifestLoadingMaxRetry: 1,
           manifestLoadingRetryDelay: 600,
@@ -263,7 +375,6 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
             });
         });
 
-        // Reset retry counters on successful segment loaded
         hls.on(Hls.Events.FRAG_LOADED, () => {
           networkRetryCountRef.current = 0;
           mediaRetryCountRef.current = 0;
@@ -280,7 +391,6 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
           switch (data.type) {
             case Hls.ErrorTypes.NETWORK_ERROR:
               if (!proxyMode) {
-                // If direct network failed, switch to proxy IMMEDIATELY without waiting
                 if (autoProxyTimer) clearTimeout(autoProxyTimer);
                 clearWatchdogs();
                 cleanupMedia();
@@ -288,15 +398,8 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
                 setUseProxy(true);
                 setTimeout(() => startPlayback(true), 100);
               } else {
-                // Proxy mode also failed: Mark stream as offline
                 if (autoProxyTimer) clearTimeout(autoProxyTimer);
-                clearWatchdogs();
-                cleanupMedia();
-                setIsLoading(false);
-                setHasError(true);
-                setErrorType('OFFLINE');
-                setErrorMessage('Máy chủ IPTV từ chối kết nối hoặc đã ngừng phát sóng.');
-                onChannelError?.(channel, 'OFFLINE');
+                triggerErrorState('OFFLINE', 'Máy chủ IPTV từ chối kết nối hoặc đã ngừng phát sóng.');
               }
               break;
 
@@ -308,25 +411,13 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
               } else {
                 mediaRetryCountRef.current = 0;
                 if (autoProxyTimer) clearTimeout(autoProxyTimer);
-                clearWatchdogs();
-                cleanupMedia();
-                setIsLoading(false);
-                setHasError(true);
-                setErrorType('DECODE');
-                setErrorMessage('Định dạng video/audio này không hỗ trợ giải mã trực tiếp trên trình duyệt web.');
-                onChannelError?.(channel, 'DECODE');
+                triggerErrorState('DECODE', 'Định dạng video/audio này không hỗ trợ giải mã trực tiếp trên trình duyệt web.');
               }
               break;
 
             default:
               if (autoProxyTimer) clearTimeout(autoProxyTimer);
-              clearWatchdogs();
-              cleanupMedia();
-              setIsLoading(false);
-              setHasError(true);
-              setErrorType('DECODE');
-              setErrorMessage('Định dạng luồng phát không tương thích với trình duyệt hiện tại.');
-              onChannelError?.(channel, 'DECODE');
+              triggerErrorState('DECODE', 'Định dạng luồng phát không tương thích với trình duyệt hiện tại.');
               break;
           }
         });
@@ -362,13 +453,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
                   setUseProxy(true);
                   setTimeout(() => startPlayback(true), 100);
                 } else {
-                  clearWatchdogs();
-                  cleanupMedia();
-                  setIsLoading(false);
-                  setHasError(true);
-                  setErrorType('OFFLINE');
-                  setErrorMessage('Trình duyệt không thể phát luồng này trực tiếp.');
-                  onChannelError?.(channel, 'OFFLINE');
+                  triggerErrorState('OFFLINE', 'Trình duyệt không thể phát luồng này trực tiếp.');
                 }
               });
           });
@@ -391,17 +476,11 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
             setUseProxy(true);
             setTimeout(() => startPlayback(true), 100);
           } else {
-            clearWatchdogs();
-            cleanupMedia();
-            setIsLoading(false);
-            setHasError(true);
-            setErrorType('OFFLINE');
-            setErrorMessage('Trình duyệt không hỗ trợ giải mã trực tiếp luồng này.');
-            onChannelError?.(channel, 'OFFLINE');
+            triggerErrorState('OFFLINE', 'Trình duyệt không hỗ trợ giải mã trực tiếp luồng này.');
           }
         });
     },
-    [channel, getStreamSource, cleanupMedia, clearWatchdogs, onChannelError]
+    [channel, getStreamSource, cleanupMedia, clearWatchdogs, clearAutoSkipTimer, triggerErrorState]
   );
 
   // Catch unhandled native video element errors
@@ -429,20 +508,17 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
       return;
     }
 
-    setHasError(true);
-    setErrorType('OFFLINE');
-    setErrorMessage(
+    triggerErrorState(
+      'OFFLINE',
       'Nguồn phát IPTV thường chặn CORS hoặc sử dụng giao thức chỉ hỗ trợ trên app chuyên dụng (VLC, CorePlayer).'
     );
-    if (channel) {
-      onChannelError?.(channel, 'OFFLINE');
-    }
   };
 
   // Trigger playback on channel change or playTrigger
   useEffect(() => {
     if (!channel) return;
     cleanupMedia();
+    clearAutoSkipTimer();
     setHasError(false);
 
     const initialProxy =
@@ -458,8 +534,9 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
     return () => {
       clearTimeout(timer);
       cleanupMedia();
+      clearAutoSkipTimer();
     };
-  }, [channel, playTrigger, cleanupMedia, startPlayback]);
+  }, [channel, playTrigger, cleanupMedia, clearAutoSkipTimer, startPlayback]);
 
   // Synchronize audio muted / volume state with native video element
   const syncAudioState = useCallback(() => {
@@ -588,6 +665,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
   const handlePlayServerGateway = () => {
     if (!channel) return;
     cleanupMedia();
+    clearAutoSkipTimer();
     setHasError(false);
     setIsLoading(true);
     setErrorMessage('');
@@ -615,11 +693,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
           })
           .catch((err) => {
             console.error('Server gateway playback failed:', err);
-            setHasError(true);
-            setErrorType('OFFLINE');
-            setErrorMessage('Máy chủ không thể chuyển mã luồng phát này.');
-            setIsLoading(false);
-            onChannelError?.(channel, 'GATEWAY_ERROR');
+            triggerErrorState('OFFLINE', 'Máy chủ không thể chuyển mã luồng phát này.');
           });
       });
   };
@@ -710,6 +784,14 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
               </button>
             )}
 
+            {/* Auto-Seek Recovery Success Toast */}
+            {showRecoveredToast && (
+              <div className="absolute top-12 left-1/2 -translate-x-1/2 z-20 bg-emerald-500 text-neutral-950 font-bold px-4 py-1.5 rounded-full text-xs flex items-center gap-1.5 shadow-xl border border-emerald-300 animate-fadeIn">
+                <CheckCircle2 className="w-4 h-4 text-neutral-950" />
+                <span>Đã tìm thấy kênh hoạt động: {channel?.name}!</span>
+              </div>
+            )}
+
             {/* Big Center Play Button Overlay */}
             {!isPlaying && !isLoading && (
               <button
@@ -742,12 +824,12 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
                 </p>
 
                 {/* Instant Skip button during loading */}
-                {onNextChannel && (
+                {onNextChannel && !isLastChannel && (
                   <button
                     type="button"
                     onClick={(e) => {
                       e.stopPropagation();
-                      onNextChannel();
+                      onNextChannel(false);
                     }}
                     className="mt-3.5 px-3 py-1.5 bg-neutral-800/90 hover:bg-neutral-700 text-neutral-300 hover:text-white rounded-lg text-xs font-medium flex items-center gap-1.5 border border-neutral-700 shadow-md transition pointer-events-auto cursor-pointer"
                     title="Bỏ qua kênh này để chuyển kênh kế tiếp ngay"
@@ -784,17 +866,117 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
               {channel.name}
             </h4>
 
-            <p className="text-xs text-neutral-400 max-w-md mt-1 mb-4 leading-relaxed">
+            <p className="text-xs text-neutral-400 max-w-md mt-1 mb-3 leading-relaxed">
               {errorMessage || 'Nguồn phát IPTV thường chặn CORS hoặc sử dụng giao thức chỉ hỗ trợ trên app chuyên dụng.'}
             </p>
 
+            {/* CASE 1: Reached Bottom of List Notice (Halt auto-skip cleanly) */}
+            {isLastChannel && (
+              <div className="w-full max-w-md bg-neutral-900/95 border border-amber-500/40 rounded-xl p-3.5 mb-3 text-xs text-neutral-300 text-center shadow-xl animate-fadeIn">
+                <div className="flex items-center justify-center gap-1.5 font-bold text-amber-400 mb-1 text-sm">
+                  <CheckCircle2 className="w-4 h-4 text-amber-400" />
+                  <span>Đã duyệt tới kênh dưới cùng trong danh sách</span>
+                </div>
+                <p className="text-[11px] text-neutral-400 leading-relaxed">
+                  Đã kiểm tra tới kênh cuối cùng trong danh sách ({totalChannelsInList} kênh). Không còn kênh tiếp theo phía dưới.
+                  {consecutiveSkippedCount > 0 && ` (Đã tự động kiểm tra và bỏ qua ${consecutiveSkippedCount} kênh lỗi liên tiếp).`}
+                </p>
+                {onNextChannel && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setConsecutiveSkippedCount(0);
+                      onNextChannel(false);
+                    }}
+                    className="mt-3 px-3.5 py-1.5 bg-amber-500 hover:bg-amber-400 text-neutral-950 font-bold rounded-lg text-xs inline-flex items-center gap-1.5 transition cursor-pointer shadow hover:scale-105 active:scale-95"
+                  >
+                    <RotateCcw className="w-3.5 h-3.5" />
+                    Quay lại kênh đầu danh sách
+                  </button>
+                )}
+              </div>
+            )}
+
+            {/* CASE 2: Active Auto-Skip Countdown (Moving towards next working channel) */}
+            {!isLastChannel && autoSkipOnError && onNextChannel && autoSkipCountdown !== null && (
+              <div className="w-full max-w-md bg-amber-950/60 border border-amber-500/60 rounded-xl p-3 mb-3 text-xs shadow-xl shadow-amber-950/50 backdrop-blur-sm animate-fadeIn">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <div className="w-2.5 h-2.5 rounded-full bg-amber-400 animate-ping flex-shrink-0" />
+                    <div className="truncate">
+                      <span className="text-amber-200 font-medium">
+                        Tự chuyển kênh kế tiếp sau{' '}
+                        <strong className="text-white text-sm font-bold font-mono px-1.5 py-0.5 bg-amber-500/20 rounded border border-amber-400/40">
+                          {autoSkipCountdown}s
+                        </strong>
+                      </span>
+                      {totalChannelsInList && currentChannelIndex ? (
+                        <span className="text-[10px] text-amber-400/80 ml-1.5 font-mono">
+                          (Kênh {currentChannelIndex}/{totalChannelsInList})
+                        </span>
+                      ) : null}
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-1.5 flex-shrink-0">
+                    <button
+                      type="button"
+                      onClick={handleCancelAutoSkip}
+                      className="px-2.5 py-1 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 rounded-md text-[11px] font-semibold transition cursor-pointer border border-neutral-700 hover:text-white"
+                      title="Dừng tự động chuyển kênh"
+                    >
+                      Dừng tìm
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleSkipNow}
+                      className="px-3 py-1 bg-amber-500 hover:bg-amber-400 text-neutral-950 rounded-md text-[11px] font-bold transition cursor-pointer shadow hover:scale-105 active:scale-95"
+                      title="Chuyển ngay lập tức"
+                    >
+                      Chuyển ngay
+                    </button>
+                  </div>
+                </div>
+
+                <div className="mt-2.5 pt-2 border-t border-amber-500/25 flex flex-wrap items-center justify-between gap-2 text-[11px] text-amber-300/90">
+                  <span className="flex items-center gap-1.5">
+                    <FastForward className="w-3.5 h-3.5 text-amber-400 flex-shrink-0" />
+                    Tự động tìm kiếm đến khi có kênh hoạt động hoặc tới kênh cuối danh sách
+                  </span>
+                  {consecutiveSkippedCount > 0 && (
+                    <span className="font-mono text-amber-300 font-bold bg-amber-900/60 px-2 py-0.5 rounded border border-amber-600/40 text-[10px]">
+                      Đã bỏ qua: {consecutiveSkippedCount} kênh lỗi
+                    </span>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* Toggle Switch directly on the Error Screen */}
+            {onToggleAutoSkip && (
+              <div className="mb-3.5 flex items-center justify-center">
+                <button
+                  type="button"
+                  onClick={onToggleAutoSkip}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition border cursor-pointer ${
+                    autoSkipOnError
+                      ? 'bg-amber-500/15 text-amber-300 border-amber-500/40 hover:bg-amber-500/25'
+                      : 'bg-neutral-900 text-neutral-400 border-neutral-800 hover:text-white'
+                  }`}
+                  title="Bật/Tắt tính năng tự động chuyển kênh khi gặp lỗi"
+                >
+                  <FastForward className={`w-3.5 h-3.5 ${autoSkipOnError ? 'text-amber-400' : 'text-neutral-500'}`} />
+                  <span>Tự động chuyển khi lỗi: <strong className={autoSkipOnError ? 'text-amber-300 font-bold' : 'text-neutral-400'}>{autoSkipOnError ? 'ĐANG BẬT' : 'ĐANG TẮT'}</strong></span>
+                </button>
+              </div>
+            )}
+
             {/* Quick Action Matrix */}
             <div className="flex flex-wrap gap-2 justify-center max-w-md">
-              {/* PRIMARY: Next Channel button (Fastest way to keep user happy!) */}
+              {/* PRIMARY: Next Channel button */}
               {onNextChannel && (
                 <button
                   type="button"
-                  onClick={onNextChannel}
+                  onClick={() => onNextChannel(false)}
                   className="px-4 py-2 bg-amber-500 hover:bg-amber-400 text-neutral-950 font-bold rounded-lg text-xs flex items-center gap-1.5 transition shadow-lg shadow-amber-500/25 cursor-pointer hover:scale-105 active:scale-95"
                   title="Chuyển ngay sang kênh tiếp theo trong danh sách"
                 >
@@ -923,11 +1105,29 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
           {onNextChannel && (
             <button
               type="button"
-              onClick={onNextChannel}
+              onClick={() => onNextChannel(false)}
               className="p-1.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 rounded-lg text-xs border border-neutral-700 transition cursor-pointer"
               title="Kênh kế tiếp"
             >
               <SkipForward className="w-3.5 h-3.5" />
+            </button>
+          )}
+
+          {/* Auto-Skip on error toggle */}
+          {onToggleAutoSkip && (
+            <button
+              type="button"
+              onClick={onToggleAutoSkip}
+              className={`px-2.5 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1 transition border cursor-pointer ${
+                autoSkipOnError
+                  ? 'bg-amber-950/60 text-amber-300 border-amber-600/60 hover:bg-amber-900/60'
+                  : 'bg-neutral-800 text-neutral-400 border-neutral-700 hover:text-white'
+              }`}
+              title="Tự động chuyển sang kênh kế tiếp nếu kênh hiện tại bị lỗi nguồn"
+            >
+              <FastForward className={`w-3.5 h-3.5 ${autoSkipOnError ? 'text-amber-400' : 'text-neutral-500'}`} />
+              <span className="hidden sm:inline">Tự chuyển khi lỗi:</span>
+              <span>{autoSkipOnError ? 'BẬT' : 'TẮT'}</span>
             </button>
           )}
 

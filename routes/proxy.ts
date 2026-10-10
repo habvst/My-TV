@@ -6,19 +6,21 @@ import zlib from 'zlib';
 
 const router = Router();
 
-// Reusable Keep-Alive agents to avoid TCP handshake overhead and socket exhaustion on IPTV streams
+// Reusable Keep-Alive agents to avoid TCP handshake overhead while avoiding stale socket hang-ups
 const httpAgent = new http.Agent({
   keepAlive: true,
+  keepAliveMsecs: 1500,
   maxSockets: 64,
   maxFreeSockets: 16,
-  timeout: 60000,
+  timeout: 10000,
 });
 
 const httpsAgent = new https.Agent({
   keepAlive: true,
+  keepAliveMsecs: 1500,
   maxSockets: 64,
   maxFreeSockets: 16,
-  timeout: 60000,
+  timeout: 10000,
   rejectUnauthorized: false, // Permit IPTV servers with self-signed or expired certs
 });
 
@@ -31,26 +33,16 @@ router.options(['/api/proxy/stream', '/api/proxy/stream.m3u8', '/api/proxy/strea
 });
 
 /**
- * Universal IPTV Stream Proxy
- * - Resolves CORS issues for modern browsers
- * - Bridges mixed-content (HTTP streams loaded on HTTPS pages)
- * - Automatically rewrites .m3u8 manifests so that chunklists and .ts segments route through this proxy
- * - Maintains Keep-Alive connections to upstream IPTV servers
+ * Perform proxy request with automatic 1-time fallback if a pooled socket hung up
  */
-router.get(['/api/proxy/stream', '/api/proxy/stream.m3u8', '/api/proxy/stream/playlist.m3u8'], async (req: Request, res: Response) => {
-  const targetUrl = req.query.url as string;
-
-  if (!targetUrl || typeof targetUrl !== 'string') {
-    return res.status(400).send('Missing "url" parameter');
-  }
-
+function handleProxyStream(req: Request, res: Response, targetUrl: string, isRetry = false) {
   let parsedUrl: URL;
   try {
     parsedUrl = new URL(targetUrl);
     if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
       return res.status(400).send('Invalid protocol. Only HTTP and HTTPS are supported.');
     }
-  } catch (err) {
+  } catch {
     return res.status(400).send('Invalid target URL');
   }
 
@@ -62,18 +54,18 @@ router.get(['/api/proxy/stream', '/api/proxy/stream.m3u8', '/api/proxy/stream/pl
   try {
     const isHttps = parsedUrl.protocol === 'https:';
     const client = isHttps ? https : http;
-    const agent = isHttps ? httpsAgent : httpAgent;
+    // On retry after socket hang-up, use fresh connection (agent: false) instead of pooled agent
+    const agent = isRetry ? false : isHttps ? httpsAgent : httpAgent;
 
     const requestHeaders: Record<string, string> = {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
       'Accept': '*/*',
       'Accept-Encoding': 'identity', // Do not gzip manifests so we can rewrite text
-      'Connection': 'keep-alive',
+      'Connection': isRetry ? 'close' : 'keep-alive',
     };
 
     if (parsedUrl.origin) {
       requestHeaders['Referer'] = parsedUrl.origin + '/';
-      requestHeaders['Origin'] = parsedUrl.origin;
     }
 
     if (req.headers.range) {
@@ -88,7 +80,7 @@ router.get(['/api/proxy/stream', '/api/proxy/stream.m3u8', '/api/proxy/stream/pl
       method: req.method === 'HEAD' ? 'HEAD' : 'GET',
       headers: requestHeaders,
       agent,
-      timeout: 10000, // 10 seconds socket timeout to quickly fail dead streams
+      timeout: 10000, // 10 seconds timeout
       rejectUnauthorized: false,
     };
 
@@ -126,54 +118,52 @@ router.get(['/api/proxy/stream', '/api/proxy/stream.m3u8', '/api/proxy/stream/pl
           if (isGzip) {
             try {
               buffer = zlib.gunzipSync(buffer);
-            } catch (err: any) {
-              console.warn('[Proxy] Failed to gunzip manifest:', err.message);
+            } catch {
+              // Ignore gzip errors
             }
           } else if (encoding === 'deflate') {
             try {
               buffer = zlib.inflateSync(buffer);
-            } catch (err: any) {
-              console.warn('[Proxy] Failed to inflate manifest:', err.message);
+            } catch {
+              // Ignore inflate errors
             }
           } else if (encoding === 'br') {
             try {
               buffer = zlib.brotliDecompressSync(buffer);
-            } catch (err: any) {
-              console.warn('[Proxy] Failed to brotli decompress manifest:', err.message);
+            } catch {
+              // Ignore brotli errors
             }
           }
 
           const manifestText = buffer.toString('utf-8');
 
+          // If upstream sent an HTML error page or empty response, handle cleanly
           if (!manifestText.includes('#EXTM3U')) {
-            // Not a real manifest, send as-is
-            res.setHeader('Content-Type', contentType || 'application/vnd.apple.mpegurl');
-            return res.status(remoteRes.statusCode || 200).send(manifestText);
-          }
-
-          // Rewrite lines: any URI should go through /api/proxy/stream
-          // Handles \r\n, \r, and \n line breaks cleanly
-          const lines = manifestText.split(/\r\n|\r|\n/);
-          const rewrittenLines = lines.map((line) => {
-            const trimmed = line.trim();
-            if (!trimmed) return line;
-
-            // Handle any tag containing URI="..." (e.g. #EXT-X-KEY, #EXT-X-MAP, #EXT-X-MEDIA, #EXT-X-I-FRAME-STREAM-INF)
-            if (trimmed.startsWith('#') && trimmed.includes('URI=')) {
-              return trimmed.replace(/URI="([^"]+)"/g, (_match, uriVal) => {
-                try {
-                  const resolvedUri = new URL(uriVal, targetUrl).href;
-                  const isSub = resolvedUri.includes('.m3u8');
-                  const prefix = isSub ? '/api/proxy/stream.m3u8' : '/api/proxy/stream';
-                  return `URI="${prefix}?url=${encodeURIComponent(resolvedUri)}"`;
-                } catch {
-                  return `URI="${uriVal}"`;
-                }
+            if (!res.headersSent) {
+              return res.status(remoteRes.statusCode && remoteRes.statusCode >= 400 ? remoteRes.statusCode : 502).json({
+                error: 'invalid_manifest',
+                message: 'Máy chủ phản hồi định dạng không phải M3U8',
+                url: targetUrl
               });
             }
+            return;
+          }
 
-            // Skip other comments and directives
-            if (trimmed.startsWith('#')) {
+          const lines = manifestText.split(/\r?\n/);
+          const rewrittenLines = lines.map((line) => {
+            const trimmed = line.trim();
+            if (!trimmed || trimmed.startsWith('#')) {
+              // Special case: Rewrite URI in #EXT-X-KEY (DRM / AES encryption keys)
+              if (trimmed.startsWith('#EXT-X-KEY:') && trimmed.includes('URI="')) {
+                return trimmed.replace(/URI="([^"]+)"/, (_match, keyUri) => {
+                  try {
+                    const resolvedKeyUrl = new URL(keyUri, targetUrl).href;
+                    return `URI="/api/proxy/stream?url=${encodeURIComponent(resolvedKeyUrl)}"`;
+                  } catch {
+                    return `URI="${keyUri}"`;
+                  }
+                });
+              }
               return line;
             }
 
@@ -196,9 +186,12 @@ router.get(['/api/proxy/stream', '/api/proxy/stream.m3u8', '/api/proxy/stream/pl
           return res.status(200).send(rewrittenManifest);
         });
 
-        remoteRes.on('error', (err) => {
-          console.error('[Proxy] Manifest read error:', err.message);
-          if (!res.headersSent) res.status(502).send('Error reading stream manifest');
+        remoteRes.on('error', (err: any) => {
+          // Normal client abort when switching channels or seeking
+          if (err?.message === 'aborted' || req.destroyed || res.writableEnded || res.destroyed) {
+            return;
+          }
+          if (!res.headersSent) res.status(502).json({ error: 'manifest_read_error', message: err.message });
         });
       } else {
         // Binary media chunks (.ts, .aac, .m4s) or HEAD request: pipe directly
@@ -215,13 +208,16 @@ router.get(['/api/proxy/stream', '/api/proxy/stream.m3u8', '/api/proxy/stream/pl
         }
         res.setHeader('Cache-Control', 'public, max-age=60');
 
-        // Handle client abortion and remote stream errors cleanly
+        // Handle client abortion cleanly when user switches channel or pauses
         res.on('close', () => {
           proxyReq.destroy();
         });
 
-        remoteRes.on('error', (err) => {
-          console.warn('[Proxy] Segment streaming error:', err.message);
+        remoteRes.on('error', (err: any) => {
+          // Normal client abort when switching channels or seeking
+          if (err?.message === 'aborted' || req.destroyed || res.writableEnded || res.destroyed) {
+            return;
+          }
           if (!res.headersSent) {
             res.status(502).end();
           } else {
@@ -235,20 +231,55 @@ router.get(['/api/proxy/stream', '/api/proxy/stream.m3u8', '/api/proxy/stream/pl
 
     proxyReq.on('timeout', () => {
       proxyReq.destroy();
-      if (!res.headersSent) res.status(504).send('Stream source connection timed out');
+      if (!res.headersSent && !res.writableEnded) {
+        res.status(504).json({
+          error: 'gateway_timeout',
+          message: 'Thời gian kết nối đến máy chủ nguồn IPTV vượt quá 10 giây',
+          url: targetUrl
+        });
+      }
     });
 
-    proxyReq.on('error', (err) => {
-      console.warn('[Proxy] Request error for', targetUrl, ':', err.message);
-      if (!res.headersSent) res.status(502).send(`Proxy connection error: ${err.message}`);
+    proxyReq.on('error', (err: any) => {
+      // If client aborted the connection, do not treat as an error
+      if (req.destroyed || res.writableEnded || res.destroyed) {
+        return;
+      }
+
+      // If pooled keep-alive socket hung up and we haven't retried yet, retry immediately with fresh socket
+      if (!isRetry && (err.message.includes('socket hang up') || err.code === 'ECONNRESET')) {
+        return handleProxyStream(req, res, targetUrl, true);
+      }
+
+      // Expected upstream network failures from random IPTV sources
+      if (!res.headersSent) {
+        res.status(502).json({
+          error: 'upstream_unavailable',
+          message: `Máy chủ IPTV nguồn từ chối kết nối hoặc không phản hồi (${err.code || err.message})`,
+          url: targetUrl
+        });
+      }
     });
 
     proxyReq.end();
   } catch (err: any) {
     if (!res.headersSent) {
-      res.status(500).send(`Internal proxy error: ${err.message}`);
+      res.status(500).json({ error: 'internal_proxy_error', message: err.message });
     }
   }
+}
+
+/**
+ * Universal IPTV Stream Proxy Routes
+ */
+router.get(['/api/proxy/stream', '/api/proxy/stream.m3u8', '/api/proxy/stream/playlist.m3u8'], async (req: Request, res: Response) => {
+  const targetUrl = req.query.url as string;
+
+  if (!targetUrl || typeof targetUrl !== 'string') {
+    return res.status(400).send('Missing "url" parameter');
+  }
+
+  handleProxyStream(req, res, targetUrl, false);
 });
 
 export default router;
