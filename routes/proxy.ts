@@ -164,6 +164,33 @@ function handleProxyStream(req: Request, res: Response, targetUrl: string, isRet
                   }
                 });
               }
+
+              // Special case: Rewrite URI in #EXT-X-MAP (fMP4 initialization segment init.mp4)
+              if (trimmed.startsWith('#EXT-X-MAP:') && trimmed.includes('URI="')) {
+                return trimmed.replace(/URI="([^"]+)"/, (_match, mapUri) => {
+                  try {
+                    const resolvedMapUrl = new URL(mapUri, targetUrl).href;
+                    return `URI="/api/proxy/stream?url=${encodeURIComponent(resolvedMapUrl)}"`;
+                  } catch {
+                    return `URI="${mapUri}"`;
+                  }
+                });
+              }
+
+              // Special case: Rewrite URI in #EXT-X-MEDIA (audio/subtitles separate tracks)
+              if (trimmed.startsWith('#EXT-X-MEDIA:') && trimmed.includes('URI="')) {
+                return trimmed.replace(/URI="([^"]+)"/, (_match, mediaUri) => {
+                  try {
+                    const resolvedMediaUrl = new URL(mediaUri, targetUrl).href;
+                    const isSub = resolvedMediaUrl.includes('.m3u8');
+                    const prefix = isSub ? '/api/proxy/stream.m3u8' : '/api/proxy/stream';
+                    return `URI="${prefix}?url=${encodeURIComponent(resolvedMediaUrl)}"`;
+                  } catch {
+                    return `URI="${mediaUri}"`;
+                  }
+                });
+              }
+
               return line;
             }
 
