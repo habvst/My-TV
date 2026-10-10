@@ -76,6 +76,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
   const [errorType, setErrorType] = useState<'TIMEOUT' | 'OFFLINE' | 'DECODE' | 'UNKNOWN'>('UNKNOWN');
   const [copied, setCopied] = useState<boolean>(false);
   const [autoplayMuted, setAutoplayMuted] = useState<boolean>(false);
+  const [isGatewayMode, setIsGatewayMode] = useState<boolean>(false);
 
   // Proxy state: auto-enable if stream is insecure HTTP loaded on HTTPS
   const [useProxy, setUseProxy] = useState<boolean>(() => {
@@ -142,6 +143,8 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
     }
     if (videoRef.current) {
       try {
+        videoRef.current.oncanplay = null;
+        videoRef.current.onloadeddata = null;
         videoRef.current.pause();
         videoRef.current.removeAttribute('src');
         videoRef.current.load();
@@ -238,6 +241,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
       if (!channel) return;
       cleanupMedia();
       clearAutoSkipTimer();
+      setIsGatewayMode(false);
 
       setHasError(false);
       setErrorMessage('');
@@ -499,6 +503,15 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
     setIsPlaying(false);
     setIsLoading(false);
 
+    if (isGatewayMode) {
+      setHasError(true);
+      setErrorType('OFFLINE');
+      setErrorMessage(
+        'Máy chủ chuyển mã không thể đọc được luồng video này (Nguồn phát IPTV đã ngừng hoạt động hoặc bị chặn IP).'
+      );
+      return;
+    }
+
     if (!useProxy && channel) {
       console.info('Auto-switching to proxy mode after video element error...');
       setUseProxy(true);
@@ -520,6 +533,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
     cleanupMedia();
     clearAutoSkipTimer();
     setHasError(false);
+    setIsGatewayMode(false);
 
     const initialProxy =
       typeof window !== 'undefined' &&
@@ -662,40 +676,97 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
     }, 50);
   };
 
-  const handlePlayServerGateway = () => {
-    if (!channel) return;
+  const handleSwitchBackToHls = () => {
+    setIsGatewayMode(false);
     cleanupMedia();
     clearAutoSkipTimer();
     setHasError(false);
     setIsLoading(true);
+    setTimeout(() => {
+      startPlayback(useProxy);
+    }, 50);
+  };
+
+  const handlePlayServerGateway = () => {
+    if (!channel) return;
+    cleanupMedia();
+    clearAutoSkipTimer();
+    setIsGatewayMode(true);
+    setHasError(false);
+    setIsLoading(true);
+    setLoadingSeconds(0);
+    setLoadingMessage('Máy chủ đang kết nối và nén luồng phát (H.264/AAC)...');
     setErrorMessage('');
     const video = videoRef.current;
     if (!video) return;
 
-    const gatewayUrl = `/e72/stream/${encodeURIComponent(channel.id)}.mp4`;
-    video.src = gatewayUrl;
-    video
-      .play()
-      .then(() => {
-        setIsPlaying(true);
-        setIsLoading(false);
-        setAutoplayMuted(false);
-      })
-      .catch(() => {
-        video.muted = true;
-        setIsMuted(true);
-        video
-          .play()
-          .then(() => {
-            setIsPlaying(true);
-            setIsLoading(false);
-            setAutoplayMuted(true);
-          })
-          .catch((err) => {
-            console.error('Server gateway playback failed:', err);
-            triggerErrorState('OFFLINE', 'Máy chủ không thể chuyển mã luồng phát này.');
-          });
+    // Start loading ticker
+    if (loadingTickerRef.current) clearInterval(loadingTickerRef.current);
+    loadingTickerRef.current = setInterval(() => {
+      setLoadingSeconds((prev) => {
+        const next = prev + 1;
+        if (next === 3) {
+          setLoadingMessage('Đang khởi động bộ mã hóa FFmpeg H.264 và phân tích âm thanh...');
+        } else if (next === 6) {
+          setLoadingMessage('Đang truyền phân đoạn video MP4 đầu tiên về trình duyệt...');
+        }
+        return next;
       });
+    }, 1000);
+
+    // Watchdog timer: 15 seconds
+    if (watchdogTimerRef.current) clearTimeout(watchdogTimerRef.current);
+    watchdogTimerRef.current = setTimeout(() => {
+      clearWatchdogs();
+      setIsLoading(false);
+      setHasError(true);
+      setErrorType('TIMEOUT');
+      setErrorMessage(
+        'Thời gian chờ máy chủ chuyển mã quá 15 giây. Luồng IPTV nguồn hiện không phản hồi hoặc chặn kết nối.'
+      );
+    }, 15000);
+
+    const gatewayUrl = `/api/gateway/stream/${encodeURIComponent(channel.id)}.mp4`;
+    video.src = gatewayUrl;
+    video.preload = 'auto';
+
+    let isTriggered = false;
+    const onGatewayReady = () => {
+      if (isTriggered) return;
+      isTriggered = true;
+      video.removeEventListener('loadeddata', onGatewayReady);
+      video.removeEventListener('canplay', onGatewayReady);
+
+      clearWatchdogs();
+      setIsLoading(false);
+      setHasError(false);
+      video
+        .play()
+        .then(() => {
+          setIsPlaying(true);
+          setAutoplayMuted(false);
+        })
+        .catch((err) => {
+          console.warn('Gateway autoplay unmuted blocked by browser, trying muted:', err);
+          video.muted = true;
+          setIsMuted(true);
+          video
+            .play()
+            .then(() => {
+              setIsPlaying(true);
+              setAutoplayMuted(true);
+            })
+            .catch((e) => {
+              console.error('Server gateway playback failed:', e);
+              setIsLoading(false);
+              setHasError(true);
+              setErrorMessage('Trình duyệt không thể giải mã luồng video MP4 này.');
+            });
+        });
+    };
+
+    video.addEventListener('loadeddata', onGatewayReady);
+    video.addEventListener('canplay', onGatewayReady);
   };
 
   const handleCopy = () => {
@@ -749,6 +820,14 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
               onLoadedMetadata={syncAudioState}
               onError={handleVideoError}
             />
+
+            {/* Top Gateway Transcode Active Badge */}
+            {isGatewayMode && (
+              <div className="absolute top-3 left-3 z-20 px-2.5 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 border shadow-lg backdrop-blur-md bg-blue-950/85 text-blue-200 border-blue-600/80 animate-fadeIn">
+                <Zap className="w-3.5 h-3.5 text-amber-300 animate-pulse" />
+                <span>Gateway MP4 (H.264 / AAC)</span>
+              </div>
+            )}
 
             {/* Top Sound Control */}
             <button
@@ -1007,15 +1086,27 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
               )}
 
               {/* Server Transcode Gateway Button */}
-              <button
-                type="button"
-                onClick={handlePlayServerGateway}
-                className="px-3 py-2 bg-blue-950/60 hover:bg-blue-900/80 text-blue-200 border border-blue-800/60 font-semibold rounded-lg text-xs flex items-center gap-1.5 transition cursor-pointer"
-                title="Sử dụng máy chủ chuyển mã luồng thành MP4 trực tiếp cho trình duyệt"
-              >
-                <Zap className="w-3.5 h-3.5 text-amber-300" />
-                Chuyển mã Gateway (MP4)
-              </button>
+              {isGatewayMode ? (
+                <button
+                  type="button"
+                  onClick={handleSwitchBackToHls}
+                  className="px-3 py-2 bg-neutral-800 hover:bg-neutral-700 text-neutral-200 border border-neutral-700 font-semibold rounded-lg text-xs flex items-center gap-1.5 transition cursor-pointer"
+                  title="Quay lại chế độ phát chuẩn HLS"
+                >
+                  <RefreshCw className="w-3.5 h-3.5 text-blue-400" />
+                  Quay về phát HLS
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={handlePlayServerGateway}
+                  className="px-3 py-2 bg-blue-900 hover:bg-blue-800 text-blue-100 border border-blue-700 font-bold rounded-lg text-xs flex items-center gap-1.5 transition cursor-pointer shadow-lg shadow-blue-950/50 hover:scale-105 active:scale-95"
+                  title="Cứu cánh: Máy chủ FFmpeg giải mã âm thanh AC3/EAC3/MPEG2 và chuyển thành MP4 trực tiếp cho trình duyệt"
+                >
+                  <Zap className="w-3.5 h-3.5 text-amber-300" />
+                  Chuyển mã Gateway (MP4)
+                </button>
+              )}
 
               {/* Copy Direct URL */}
               <button
@@ -1031,8 +1122,10 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
               {/* Open in CorePlayer / VLC external link */}
               <a
                 href={`/open/${channel.id}`}
+                target="_blank"
+                rel="noopener noreferrer"
                 className="px-2.5 py-2 bg-rose-950/60 hover:bg-rose-900 text-rose-200 border border-rose-800/60 rounded-lg text-xs font-medium flex items-center gap-1 transition"
-                title="Mở qua CorePlayer trên Nokia E72 hoặc VLC"
+                title="Mở tab mới hoặc ứng dụng ngoài (CorePlayer/VLC)"
               >
                 <ExternalLink className="w-3.5 h-3.5 text-rose-300" />
                 Mở CorePlayer / VLC
@@ -1131,20 +1224,44 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
             </button>
           )}
 
-          {/* Proxy Toggle Button */}
-          <button
-            type="button"
-            onClick={handleToggleProxy}
-            className={`px-2.5 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1 transition border cursor-pointer ${
-              useProxy
-                ? 'bg-emerald-950/60 text-emerald-300 border-emerald-700/60 hover:bg-emerald-900/60'
-                : 'bg-neutral-800 text-neutral-400 border-neutral-700 hover:text-white'
-            }`}
-            title="Bật/Tắt máy chủ Proxy CORS giải quyết chặn luồng"
-          >
-            <Zap className={`w-3.5 h-3.5 ${useProxy ? 'text-emerald-400' : ''}`} />
-            <span>Proxy: {useProxy ? 'BẬT' : 'TẮT'}</span>
-          </button>
+          {/* Gateway Mode Toggle or Proxy Toggle */}
+          {isGatewayMode ? (
+            <button
+              type="button"
+              onClick={handleSwitchBackToHls}
+              className="px-2.5 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition border cursor-pointer bg-blue-950/85 text-blue-200 border-blue-600/80 hover:bg-blue-900/90 shadow-sm"
+              title="Đang trong chế độ Gateway Chuyển mã MP4. Bấm để quay về HLS chuẩn"
+            >
+              <RefreshCw className="w-3.5 h-3.5 text-blue-300" />
+              <span>Chuyển về HLS</span>
+            </button>
+          ) : (
+            <>
+              <button
+                type="button"
+                onClick={handleToggleProxy}
+                className={`px-2.5 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1 transition border cursor-pointer ${
+                  useProxy
+                    ? 'bg-emerald-950/60 text-emerald-300 border-emerald-700/60 hover:bg-emerald-900/60'
+                    : 'bg-neutral-800 text-neutral-400 border-neutral-700 hover:text-white'
+                }`}
+                title="Bật/Tắt máy chủ Proxy CORS giải quyết chặn luồng"
+              >
+                <Zap className={`w-3.5 h-3.5 ${useProxy ? 'text-emerald-400' : ''}`} />
+                <span>Proxy: {useProxy ? 'BẬT' : 'TẮT'}</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={handlePlayServerGateway}
+                className="px-2.5 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1 transition border cursor-pointer bg-blue-950/40 text-blue-300 border-blue-800/50 hover:bg-blue-900/60 hover:text-white"
+                title="Chuyển mã bằng máy chủ sang MP4 trực tiếp (dùng khi video bị giật hoặc mất tiếng)"
+              >
+                <Zap className="w-3.5 h-3.5 text-amber-300" />
+                <span className="hidden sm:inline">Gateway MP4</span>
+              </button>
+            </>
+          )}
 
           <button
             type="button"
@@ -1187,11 +1304,13 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
 
           <a
             href={`/open/${channel.id}`}
+            target="_blank"
+            rel="noopener noreferrer"
             className="px-2.5 py-1.5 bg-rose-950/60 hover:bg-rose-900 text-rose-200 border border-rose-800/50 rounded-lg text-xs flex items-center gap-1 transition"
-            title="Link mở qua CorePlayer hoặc Nokia E72"
+            title="Mở kênh trong tab mới (hỗ trợ phát trực tiếp & ứng dụng ngoài)"
           >
             <ExternalLink className="w-3.5 h-3.5" />
-            <span className="hidden sm:inline">CorePlayer</span>
+            <span className="hidden sm:inline">Mở tab mới</span>
           </a>
 
           <button

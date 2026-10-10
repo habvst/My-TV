@@ -121,9 +121,11 @@ export const ChannelCard: React.FC<ChannelCardProps> = ({
 
           <a
             href={`/open/${channel.id}`}
+            target="_blank"
+            rel="noopener noreferrer"
             onClick={(e) => e.stopPropagation()}
             className="p-1 text-rose-400 hover:text-rose-300 rounded hover:bg-rose-950/40 transition"
-            title="Mở bằng CorePlayer"
+            title="Mở tab mới"
           >
             <ExternalLink className="w-3.5 h-3.5" />
           </a>

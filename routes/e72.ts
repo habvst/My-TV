@@ -31,7 +31,7 @@ async function resolveChannel(rawInput: string): Promise<any | null> {
 }
 
 // OPTIONS preflight for streaming endpoints
-router.options(['/e72/stream/:id.:ext', '/e72/stream/:id', '/e72/play/:id.:ext', '/e72/play/:id'], (_req: Request, res: Response) => {
+router.options(['/e72/stream/:id.:ext', '/e72/stream/:id', '/api/gateway/stream/:id.:ext', '/api/gateway/stream/:id', '/e72/play/:id.:ext', '/e72/play/:id', '/e72/audio/:id'], (_req: Request, res: Response) => {
   res.writeHead(200, {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
@@ -41,21 +41,52 @@ router.options(['/e72/stream/:id.:ext', '/e72/stream/:id', '/e72/play/:id.:ext',
 });
 
 /**
- * Endpoint /e72/stream/:id or /e72/stream/:id.:ext (e.g. .ts or .mp4)
- * Dedicated real-time transcoding gateway for Nokia E72 / Symbian S60v3
- * - Supports both MPEG-TS (MIME video/MP2T) and Fragmented MP4 (MIME video/mp4)
- * - Downscales video to QVGA 320x240 (with aspect ratio preservation and letterboxing)
- * - Encodes with H.264 Baseline Profile @ Level 1.2 (hardware-decodable on ARM11 600MHz)
- * - Bitrate capped at 350-400 kbps (ideal for 3G/Wi-Fi on Nokia E72)
- * - Converts audio to AAC-LC 64 kbps, 44.1 kHz stereo
- * - Serves over plain HTTP with inline Content-Disposition for 1-Touch opening
+ * Endpoint /e72/stream/:id or /api/gateway/stream/:id or /e72/audio/:id
+ * Universal Real-Time Transcoding Gateway:
+ * - Nokia E72 / Legacy S60 Mode:
+ *   Downscales video to QVGA 320x240, Baseline 1.2 @ 320 kbps, AAC-LC 64 kbps.
+ *   Optimized for ARM11 600MHz CPU & CorePlayer 1.3.x on Symbian S60v3.
+ * - Audio-Only Mode (.aac, .mp3, /e72/audio/:id, or ?type=audio):
+ *   Ultra-low bandwidth (48-64 kbps AAC/MP3) for background radio listening and 2G/3G data savings.
+ * - Web Gateway Mode (for modern browsers on desktop/mobile):
+ *   Transcodes incompatible IPTV streams up to 720p HD with ultra-low latency.
  */
-router.all(['/e72/stream/:id.:ext', '/e72/stream/:id'], async (req: Request, res: Response) => {
+router.all([
+  '/e72/stream/:id.:ext',
+  '/e72/stream/:id',
+  '/api/gateway/stream/:id.:ext',
+  '/api/gateway/stream/:id',
+  '/e72/audio/:id.:ext',
+  '/e72/audio/:id',
+], async (req: Request, res: Response) => {
   const rawId = req.params.id || '';
   const extParam = (req.params.ext || '').toLowerCase();
   const formatQuery = (req.query.format as string || req.query.type as string || '').toLowerCase();
+  const qualityQuery = (req.query.quality as string || '').toLowerCase();
+  const userAgentHeader = (req.headers['user-agent'] as string || '');
+  const isAudioRoute = req.path.includes('/audio/');
 
-  const isMp4 = extParam === 'mp4' || formatQuery === 'mp4' || /\.mp4$/i.test(rawId);
+  const isAudioOnly = isAudioRoute ||
+    extParam === 'aac' || extParam === 'mp3' ||
+    formatQuery === 'audio' || formatQuery === 'aac' || formatQuery === 'mp3' ||
+    qualityQuery === 'audio';
+
+  const isMp4 = !isAudioOnly && (extParam === 'mp4' || formatQuery === 'mp4' || /\.mp4$/i.test(rawId));
+
+  // Determine if client requires Nokia S60 / CorePlayer profile:
+  // - Explicit quality query: 'e72', 'qvga', 'low'
+  // - Symbian / Nokia / S60 / CorePlayer / RealPlayer user agent
+  // - MPEG-TS request on /e72/ path without explicit 'hd' request
+  const isS60UserAgent = /Symbian|Nokia|Series60|\bS60\b|CorePlayer|NSPlayer|RealPlayer/i.test(userAgentHeader);
+  const isExplicitDesktopWeb = /Windows NT|Macintosh|Mac OS X|Linux x86_64|Android|iPhone|iPad/i.test(userAgentHeader) && !isS60UserAgent;
+
+  let isE72Client = qualityQuery === 'e72' || qualityQuery === 'qvga' || qualityQuery === 'low' || isS60UserAgent;
+  if (!isE72Client && !isExplicitDesktopWeb) {
+    // Default to E72 for /e72/ paths if not explicitly a modern desktop browser
+    if (req.path.startsWith('/e72/')) {
+      isE72Client = qualityQuery !== 'hd' && qualityQuery !== 'web';
+    }
+  }
 
   const channel = await resolveChannel(rawId);
 
@@ -69,10 +100,24 @@ router.all(['/e72/stream/:id.:ext', '/e72/stream/:id'], async (req: Request, res
   // Record click / view asynchronously
   recordChannelClick(channel.id).catch(() => {});
 
-  // Set HTTP headers optimized for Symbian / CorePlayer / RealPlayer
-  const contentType = isMp4 ? 'video/mp4' : 'video/MP2T';
+  // Determine Content-Type and Filename
+  let contentType = 'video/MP2T';
+  let fileExt = 'ts';
+  if (isAudioOnly) {
+    if (extParam === 'mp3' || formatQuery === 'mp3') {
+      contentType = 'audio/mpeg';
+      fileExt = 'mp3';
+    } else {
+      contentType = 'audio/aac';
+      fileExt = 'aac';
+    }
+  } else if (isMp4) {
+    contentType = 'video/mp4';
+    fileExt = 'mp4';
+  }
+
   const safeId = channel.id.replace(/[^\w-]/g, '_');
-  const fileName = `${safeId}_e72.${isMp4 ? 'mp4' : 'ts'}`;
+  const fileName = `${safeId}_stream.${fileExt}`;
 
   // HEAD request support: Return headers immediately without spawning FFmpeg
   if (req.method === 'HEAD') {
@@ -99,7 +144,13 @@ router.all(['/e72/stream/:id.:ext', '/e72/stream/:id'], async (req: Request, res
     }
   }
 
-  console.log(`[E72 Transcode] Starting ${isMp4 ? 'MP4' : 'MPEG-TS'} stream for "${channel.name}" (${channel.id}) to ${clientIp} [Session: ${sessionId}]`);
+  const modeLabel = isAudioOnly
+    ? `Audio-Only (${fileExt.toUpperCase()})`
+    : isE72Client
+    ? 'E72 QVGA 320x240'
+    : 'Web HD 720p';
+
+  console.log(`[Transcode Gateway] Starting ${modeLabel} stream for "${channel.name}" (${channel.id}) to ${clientIp} [Session: ${sessionId}]`);
 
   res.writeHead(200, {
     'Content-Type': contentType,
@@ -112,42 +163,110 @@ router.all(['/e72/stream/:id.:ext', '/e72/stream/:id'], async (req: Request, res
     'Accept-Ranges': 'none',
   });
 
-  // Base FFmpeg arguments tailored strictly to Nokia E72 hardware capabilities
-  const ffmpegArgs = [
-    '-re', // Read input at native framerate
+  // Base input options with fast probe and resilient reconnects
+  const ffmpegArgs: string[] = [
+    '-re', // Read input at native framerate to preserve realtime sync
+    '-analyzeduration', '2000000',
+    '-probesize', '2000000',
     '-reconnect', '1',
-    '-reconnect_at_eof', '1',
     '-reconnect_streamed', '1',
-    '-reconnect_delay_max', '3',
-    '-timeout', '12000000', // 12s socket timeout
-    '-user_agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    '-reconnect_delay_max', '2',
+    '-rw_timeout', '12000000', // 12s I/O timeout
+    '-user_agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
     '-i', channel.stream_url,
-    // Video: 320x240 QVGA with padding to preserve aspect ratio
-    '-vf', 'scale=320:240:force_original_aspect_ratio=decrease,pad=320:240:(ow-iw)/2:(oh-ih)/2',
-    '-c:v', 'libx264',
-    '-pix_fmt', 'yuv420p',
-    '-profile:v', 'baseline',
-    '-level', '1.2',
-    '-preset', 'ultrafast',
-    '-tune', 'zerolatency',
-    '-b:v', '350k',
-    '-maxrate', '400k',
-    '-bufsize', '800k',
-    '-r', '24',
-    '-g', '48', // 2-second GOP
-    // Audio: AAC-LC 64k stereo 44.1kHz
-    '-c:a', 'aac',
-    '-b:a', '64k',
-    '-ar', '44100',
-    '-ac', '2',
   ];
 
-  if (isMp4) {
-    // Fragmented MP4 progressive stream for RealPlayer / CorePlayer
-    ffmpegArgs.push('-f', 'mp4', '-movflags', 'frag_keyframe+empty_moov+default_base_moof', 'pipe:1');
+  if (isAudioOnly) {
+    // Audio-Only Profile: 48-64 kbps AAC or MP3
+    if (fileExt === 'mp3') {
+      ffmpegArgs.push(
+        '-vn',
+        '-c:a', 'libmp3lame',
+        '-b:a', '64k',
+        '-ar', '44100',
+        '-ac', '2',
+        '-f', 'mp3',
+        'pipe:1'
+      );
+    } else {
+      ffmpegArgs.push(
+        '-vn',
+        '-c:a', 'aac',
+        '-b:a', '64k',
+        '-ar', '44100',
+        '-ac', '2',
+        '-f', 'adts',
+        'pipe:1'
+      );
+    }
+  } else if (isE72Client) {
+    // Legacy Nokia E72: 320x240 QVGA @ 320kbps Baseline 1.2, 24fps
+    ffmpegArgs.push(
+      '-vf', 'scale=320:240:force_original_aspect_ratio=decrease,pad=320:240:(ow-iw)/2:(oh-ih)/2:black',
+      '-c:v', 'libx264',
+      '-pix_fmt', 'yuv420p',
+      '-profile:v', 'baseline',
+      '-level', '1.2',
+      '-preset', 'ultrafast',
+      '-tune', 'zerolatency',
+      '-b:v', '320k',
+      '-maxrate', '380k',
+      '-bufsize', '600k',
+      '-r', '24',
+      '-g', '48',
+      '-keyint_min', '24',
+      '-sc_threshold', '0',
+      '-c:a', 'aac',
+      '-b:a', '64k',
+      '-ar', '44100',
+      '-ac', '2'
+    );
+
+    if (isMp4) {
+      ffmpegArgs.push(
+        '-f', 'mp4',
+        '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+        '-frag_duration', '1000000',
+        '-flush_packets', '1',
+        'pipe:1'
+      );
+    } else {
+      ffmpegArgs.push('-f', 'mpegts', 'pipe:1');
+    }
   } else {
-    // MPEG-TS over HTTP pipe
-    ffmpegArgs.push('-f', 'mpegts', 'pipe:1');
+    // Modern Web Gateway: Crisp HD up to 720p, zero letterboxing distortion
+    ffmpegArgs.push(
+      '-vf', 'scale=min(1280\\,iw):-2',
+      '-c:v', 'libx264',
+      '-pix_fmt', 'yuv420p',
+      '-profile:v', 'baseline',
+      '-level', '3.1',
+      '-preset', 'ultrafast',
+      '-tune', 'zerolatency',
+      '-b:v', '1600k',
+      '-maxrate', '2200k',
+      '-bufsize', '2800k',
+      '-r', '25',
+      '-g', '30',
+      '-keyint_min', '25',
+      '-sc_threshold', '0',
+      '-c:a', 'aac',
+      '-b:a', '128k',
+      '-ar', '44100',
+      '-ac', '2'
+    );
+
+    if (isMp4) {
+      ffmpegArgs.push(
+        '-f', 'mp4',
+        '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+        '-frag_duration', '1000000',
+        '-flush_packets', '1',
+        'pipe:1'
+      );
+    } else {
+      ffmpegArgs.push('-f', 'mpegts', 'pipe:1');
+    }
   }
 
   let ffmpeg: ChildProcess;
@@ -275,7 +394,12 @@ router.get(['/e72/play/:id.:ext', '/e72/play/:id'], async (req: Request, res: Re
     return res.redirect(`/e72/stream/${encodeURIComponent(channel.id)}.mp4`);
   }
 
-  // 3. RealPlayer RAM metafile (natively launched by RealPlayer in Symbian)
+  // 3. Audio-Only Stream Redirect (Radio mode for 2G/3G & battery saving)
+  if (type === 'audio' || type === 'aac' || type === 'mp3' || type === 'radio') {
+    return res.redirect(`/e72/audio/${encodeURIComponent(channel.id)}.aac`);
+  }
+
+  // 4. RealPlayer RAM metafile (natively launched by RealPlayer in Symbian)
   if (type === 'ram' || type === 'realplayer') {
     const ramContent = `http://${host}/e72/stream/${encodeURIComponent(channel.id)}.mp4\n`;
     res.setHeader('Content-Type', 'audio/x-pn-realaudio');
@@ -283,20 +407,24 @@ router.get(['/e72/play/:id.:ext', '/e72/play/:id'], async (req: Request, res: Re
     return res.send(ramContent);
   }
 
-  // 4. Custom URI Scheme
+  // 5. Custom URI Scheme
   if (type === 'coreplayer' || type === 'scheme') {
     return res.redirect(`coreplayer://http://${host}/e72/stream/${encodeURIComponent(channel.id)}.ts`);
   }
 
-  // 5. Default: Inline M3U file (Gold standard for 1-Touch CorePlayer on Nokia E72)
-  const streamUrl = `http://${host}/e72/stream/${encodeURIComponent(channel.id)}.ts`;
+  // 6. Default: Inline M3U file (Gold standard for 1-Touch CorePlayer on Nokia E72)
+  const isAudioM3u = req.query.audio === '1' || type === 'audio_m3u';
+  const streamUrl = isAudioM3u
+    ? `http://${host}/e72/audio/${encodeURIComponent(channel.id)}.aac`
+    : `http://${host}/e72/stream/${encodeURIComponent(channel.id)}.ts`;
+
   const m3uContent = `#EXTM3U
-#EXTINF:-1 tvg-id="${channel.tvg_id || ''}" tvg-name="${channel.name}" group-title="${channel.group}",${channel.name} [E72]
+#EXTINF:-1 tvg-id="${channel.tvg_id || ''}" tvg-name="${channel.name}" group-title="${channel.group}",${channel.name} [E72 ${isAudioM3u ? 'AUDIO' : 'QVGA'}]
 ${streamUrl}
 `;
 
   res.setHeader('Content-Type', 'audio/x-mpegurl; charset=utf-8');
-  res.setHeader('Content-Disposition', `inline; filename="${safeId}_e72.m3u"`);
+  res.setHeader('Content-Disposition', `inline; filename="${safeId}_e72${isAudioM3u ? '_audio' : ''}.m3u"`);
   res.send(m3uContent);
 });
 
@@ -321,16 +449,19 @@ router.get(['/e72/channel/:id.m3u', '/e72/channel/:id'], async (req: Request, re
 
   const host = req.get('host') || '0.0.0.0:10000';
   const safeId = channel.id.replace(/[^\w-]/g, '_');
+  const isAudio = req.query.type === 'audio' || req.query.audio === '1';
   // Use http scheme so Nokia E72 won't attempt SSL handshake
-  const streamUrl = `http://${host}/e72/stream/${encodeURIComponent(channel.id)}.ts`;
+  const streamUrl = isAudio
+    ? `http://${host}/e72/audio/${encodeURIComponent(channel.id)}.aac`
+    : `http://${host}/e72/stream/${encodeURIComponent(channel.id)}.ts`;
 
   const m3uContent = `#EXTM3U
-#EXTINF:-1 tvg-id="${channel.tvg_id || ''}" tvg-name="${channel.name}" group-title="${channel.group}",${channel.name} [E72 QVGA 320x240]
+#EXTINF:-1 tvg-id="${channel.tvg_id || ''}" tvg-name="${channel.name}" group-title="${channel.group}",${channel.name} [E72 ${isAudio ? 'Radio Audio-Only' : 'QVGA 320x240'}]
 ${streamUrl}
 `;
 
   res.setHeader('Content-Type', 'audio/x-mpegurl; charset=utf-8');
-  res.setHeader('Content-Disposition', `inline; filename="${safeId}_e72.m3u"`);
+  res.setHeader('Content-Disposition', `inline; filename="${safeId}_e72${isAudio ? '_audio' : ''}.m3u"`);
   res.send(m3uContent);
 });
 
@@ -338,21 +469,42 @@ ${streamUrl}
  * Endpoint /e72/playlist.m3u
  * Full M3U playlist containing all channels converted into Nokia E72 stream URLs
  */
-router.get('/e72/playlist.m3u', async (req: Request, res: Response) => {
+router.get(['/e72/playlist.m3u', '/e72/playlist/:group.m3u', '/e72/playlist-audio.m3u'], async (req: Request, res: Response) => {
   try {
-    const channels = await getAllChannels();
-    const host = req.get('host') || '0.0.0.0:10000';
+    let channels = await getAllChannels();
+    const groupParam = req.params.group ? decodeURIComponent(req.params.group).trim() : '';
+    const isAudioOnly = req.path.includes('playlist-audio') || req.query.type === 'audio';
 
-    let content = '#EXTM3U name="MY IPTV - Nokia E72 Edition (QVGA 320x240)"\n\n';
+    if (groupParam && groupParam !== 'all') {
+      channels = channels.filter(c => c.group.toLowerCase() === groupParam.toLowerCase());
+    }
+
+    const host = req.get('host') || '0.0.0.0:10000';
+    const title = groupParam
+      ? `MY IPTV - Nokia E72 [${groupParam}]`
+      : isAudioOnly
+      ? 'MY IPTV - Nokia E72 Radio Audio-Only Edition'
+      : 'MY IPTV - Nokia E72 Edition (QVGA 320x240)';
+
+    let content = `#EXTM3U name="${title}"\n\n`;
 
     for (const c of channels) {
-      const streamUrl = `http://${host}/e72/stream/${encodeURIComponent(c.id)}`;
-      content += `#EXTINF:-1 tvg-id="${c.tvg_id || ''}" tvg-name="${c.name}" tvg-logo="${c.logo || ''}" group-title="${c.group}",${c.name}\n`;
+      const streamUrl = isAudioOnly
+        ? `http://${host}/e72/audio/${encodeURIComponent(c.id)}.aac`
+        : `http://${host}/e72/stream/${encodeURIComponent(c.id)}.ts`;
+
+      content += `#EXTINF:-1 tvg-id="${c.tvg_id || ''}" tvg-name="${c.name}" tvg-logo="${c.logo || ''}" group-title="${c.group}",${c.name} [E72]\n`;
       content += `${streamUrl}\n\n`;
     }
 
+    const filename = groupParam
+      ? `nokia_e72_${groupParam.toLowerCase().replace(/[^\w-]/g, '_')}.m3u`
+      : isAudioOnly
+      ? 'nokia_e72_radio_iptv.m3u'
+      : 'nokia_e72_iptv.m3u';
+
     res.setHeader('Content-Type', 'audio/x-mpegurl; charset=utf-8');
-    res.setHeader('Content-Disposition', 'attachment; filename="nokia_e72_iptv.m3u"');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
     res.send(content);
   } catch (err: any) {
     res.status(500).send(`Error generating playlist: ${err.message}`);

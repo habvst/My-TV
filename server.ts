@@ -9,7 +9,7 @@ import proxyRouter from './routes/proxy.js';
 import e72Router from './routes/e72.js';
 import { getPlaylists } from './src/db/storage.js';
 import { detectDevice } from './utils/deviceDetector.js';
-import { renderLegacyHome, renderLegacyChannel, renderLegacyNotFound } from './views/legacyRenderer.js';
+import { renderLegacyHome, renderLegacyChannel, renderLegacyNotFound, renderLegacyPlaylists, renderLegacyHelp } from './views/legacyRenderer.js';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -152,7 +152,13 @@ async function handleLegacyChannel(req: Request, res: Response) {
     return res.send(renderLegacyNotFound());
   }
 
-  const html = renderLegacyChannel(channel);
+  const allChannels = await getAllChannels();
+  const currentIndex = allChannels.findIndex((c) => c.id.toLowerCase() === channel.id.toLowerCase());
+  const prevChannel = currentIndex > 0 ? allChannels[currentIndex - 1] : null;
+  const nextChannel = currentIndex !== -1 && currentIndex < allChannels.length - 1 ? allChannels[currentIndex + 1] : null;
+  const host = req.get('host') || '0.0.0.0:3000';
+
+  const html = renderLegacyChannel(channel, { prevChannel, nextChannel, host });
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.send(html);
 }
@@ -164,6 +170,16 @@ app.get('/legacy', (req, res) => {
 
 app.get('/legacy/channel/:id', (req, res) => {
   handleLegacyChannel(req, res).catch(() => res.status(500).send('Lỗi máy chủ'));
+});
+
+app.get('/legacy/playlists', (_req, res) => {
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.send(renderLegacyPlaylists());
+});
+
+app.get('/legacy/help', (_req, res) => {
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.send(renderLegacyHelp());
 });
 
 app.get('/legacy/search', (req, res) => {
