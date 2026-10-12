@@ -9,6 +9,7 @@ import { CategoryScrollNav } from './components/CategoryScrollNav';
 import { AdminPortal } from './components/AdminPortal';
 import { Pagination } from './components/Pagination';
 import { ChannelTrafficChart } from './components/ChannelTrafficChart';
+import { ChannelSearchBar } from './components/ChannelSearchBar';
 import {
   Tv,
   Search,
@@ -39,7 +40,6 @@ export default function App() {
   const [selectedChannel, setSelectedChannel] = useState<Channel | null>(null);
   const [playTrigger, setPlayTrigger] = useState<number>(0);
   const [activeGroup, setActiveGroup] = useState<string>('all');
-  const [searchQuery, setSearchQuery] = useState<string>('');
   const [debouncedQuery, setDebouncedQuery] = useState<string>('');
   const [sortOption, setSortOption] = useState<ChannelSortOption>('default');
   const [currentPage, setCurrentPage] = useState<number>(1);
@@ -115,13 +115,13 @@ export default function App() {
     }
   }, []);
 
-  // Debounce search input by 250ms
-  useEffect(() => {
-    const timer = setTimeout(() => {
-      setDebouncedQuery(searchQuery);
-    }, 250);
-    return () => clearTimeout(timer);
-  }, [searchQuery]);
+  // Handle search query updates with React.startTransition:
+  // Decoupled from input keystrokes, ensuring 100% smooth video rendering with zero stutter
+  const handleSearchChange = useCallback((query: string) => {
+    React.startTransition(() => {
+      setDebouncedQuery(query);
+    });
+  }, []);
 
   // Fetch device info & global categories list
   const fetchMetadata = useCallback(async () => {
@@ -279,7 +279,7 @@ export default function App() {
   };
 
   // Handle select & play channel - keeps list and scroll position intact
-  const handleSelectChannel = (channel: Channel) => {
+  const handleSelectChannel = useCallback((channel: Channel) => {
     setSelectedChannel(channel);
     setPlayTrigger((prev) => prev + 1);
 
@@ -304,7 +304,7 @@ export default function App() {
       }
       return updated;
     });
-  };
+  }, []);
 
   // Next and Previous Channel navigation with seamless cross-page progression
   const handleNextChannel = useCallback(
@@ -388,7 +388,7 @@ export default function App() {
   }, []);
 
   // Toggle favorite
-  const handleToggleFavorite = (channelId: string, e: React.MouseEvent) => {
+  const handleToggleFavorite = useCallback((channelId: string, e: React.MouseEvent) => {
     e.stopPropagation();
     setFavorites((prev) => {
       const updated = prev.includes(channelId)
@@ -401,13 +401,13 @@ export default function App() {
       }
       return updated;
     });
-  };
+  }, []);
 
   // Open Channel Detail modal
-  const handleOpenDetails = (channel: Channel, e?: React.MouseEvent) => {
+  const handleOpenDetails = useCallback((channel: Channel, e?: React.MouseEvent) => {
     if (e) e.stopPropagation();
     setDetailChannel(channel);
-  };
+  }, []);
 
   // Import custom channels from M3U parser
   const handleImportChannels = (newChannels: Channel[]) => {
@@ -595,7 +595,7 @@ export default function App() {
             <VideoPlayer
               channel={selectedChannel}
               playTrigger={playTrigger}
-              onOpenDetails={(ch) => handleOpenDetails(ch)}
+              onOpenDetails={handleOpenDetails}
               onNextChannel={handleNextChannel}
               onPreviousChannel={handlePreviousChannel}
               onChannelError={handleChannelError}
@@ -664,25 +664,12 @@ export default function App() {
 
           {/* Right Column: Channels Navigation & Grid (Desktop: ~44% width) */}
           <div className="w-full lg:w-[44%] flex flex-col gap-3">
-            {/* Search Box - Searches across all 11,000+ channels */}
-            <div className="relative">
-              <Search className="w-4 h-4 text-neutral-500 absolute left-3.5 top-1/2 -translate-y-1/2" />
-              <input
-                type="text"
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder="Tìm kiếm kênh trong toàn bộ hệ thống..."
-                className="w-full bg-neutral-900 border border-neutral-800 rounded-xl pl-10 pr-4 py-2.5 text-xs text-white placeholder-neutral-500 focus:outline-none focus:border-amber-500 transition shadow-inner"
-              />
-              {searchQuery && (
-                <button
-                  onClick={() => setSearchQuery('')}
-                  className="absolute right-3 top-1/2 -translate-y-1/2 text-neutral-500 hover:text-white text-xs px-1"
-                >
-                  Xóa
-                </button>
-              )}
-            </div>
+            {/* Search Box - Searches across all 11,000+ channels with zero playback stutter */}
+            <ChannelSearchBar
+              value={debouncedQuery}
+              onChange={handleSearchChange}
+              placeholder="Tìm kiếm kênh trong toàn bộ hệ thống..."
+            />
 
             {/* Category Tabs with Horizontal Scroll, Swipe, and Channel Counts */}
             <CategoryScrollNav
@@ -763,7 +750,7 @@ export default function App() {
                   type="button"
                   onClick={() => {
                     setActiveGroup('all');
-                    setSearchQuery('');
+                    setDebouncedQuery('');
                     handleSortChange('default');
                   }}
                   className="text-[11px] text-rose-400 hover:text-rose-300 hover:underline transition ml-auto"
@@ -842,7 +829,7 @@ export default function App() {
                   <button
                     onClick={() => {
                       setActiveGroup('all');
-                      setSearchQuery('');
+                      setDebouncedQuery('');
                     }}
                     className="text-[11px] text-rose-400 hover:underline ml-1"
                   >
@@ -880,7 +867,7 @@ export default function App() {
                     <button
                       onClick={() => {
                         setActiveGroup('all');
-                        setSearchQuery('');
+                        setDebouncedQuery('');
                       }}
                       className="mt-2 text-xs text-amber-400 hover:underline"
                     >
@@ -897,11 +884,11 @@ export default function App() {
                         channel={channel}
                         isActive={selectedChannel?.id === channel.id}
                         isFavorite={favorites.includes(channel.id)}
-                        isBroken={brokenChannelIds.includes(channel.id)}
+                        isBroken={brokenChannelIds.includes(channel.id) || channel.status === 'offline'}
                         onSelect={handleSelectChannel}
                         onPlay={handleSelectChannel}
                         onToggleFavorite={handleToggleFavorite}
-                        onOpenDetails={(ch, e) => handleOpenDetails(ch, e)}
+                        onOpenDetails={handleOpenDetails}
                       />
                     ))}
                   </div>

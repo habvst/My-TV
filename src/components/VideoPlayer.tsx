@@ -36,7 +36,7 @@ interface VideoPlayerProps {
   totalChannelsInList?: number;
 }
 
-export const VideoPlayer: React.FC<VideoPlayerProps> = ({
+export const VideoPlayer: React.FC<VideoPlayerProps> = React.memo(({
   channel,
   playTrigger = 0,
   onOpenDetails,
@@ -54,9 +54,39 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
   const networkRetryCountRef = useRef<number>(0);
   const mediaRetryCountRef = useRef<number>(0);
 
+  // Stable refs for callbacks & auxiliary props to guarantee zero-jank playback:
+  // Playback must NEVER restart or stutter when parent re-renders or lists change!
+  const onOpenDetailsRef = useRef(onOpenDetails);
+  onOpenDetailsRef.current = onOpenDetails;
+
+  const onNextChannelRef = useRef(onNextChannel);
+  onNextChannelRef.current = onNextChannel;
+
+  const onPreviousChannelRef = useRef(onPreviousChannel);
+  onPreviousChannelRef.current = onPreviousChannel;
+
+  const onChannelErrorRef = useRef(onChannelError);
+  onChannelErrorRef.current = onChannelError;
+
+  const autoSkipOnErrorRef = useRef(autoSkipOnError);
+  autoSkipOnErrorRef.current = autoSkipOnError;
+
+  const isLastChannelRef = useRef(isLastChannel);
+  isLastChannelRef.current = isLastChannel;
+
+  const channelRef = useRef(channel);
+  channelRef.current = channel;
+
+  // Track currently active stream identity to prevent redundant reloads & stutter
+  const currentStreamIdRef = useRef<string | null>(null);
+  const currentStreamUrlRef = useRef<string | null>(null);
+  const currentPlayTriggerRef = useRef<number>(-1);
+
   // Watchdog & Loading Ticker refs
   const watchdogTimerRef = useRef<NodeJS.Timeout | null>(null);
   const loadingTickerRef = useRef<NodeJS.Timeout | null>(null);
+  const stallTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const autoProxyTimerRef = useRef<NodeJS.Timeout | null>(null);
   const lastToggleTimeRef = useRef<number>(0);
 
   // Auto-skip Countdown timer
@@ -107,7 +137,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
     []
   );
 
-  // Clear watchdog timers
+  // Clear all watchdog and stall timers
   const clearWatchdogs = useCallback(() => {
     if (watchdogTimerRef.current) {
       clearTimeout(watchdogTimerRef.current);
@@ -116,6 +146,14 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
     if (loadingTickerRef.current) {
       clearInterval(loadingTickerRef.current);
       loadingTickerRef.current = null;
+    }
+    if (stallTimerRef.current) {
+      clearTimeout(stallTimerRef.current);
+      stallTimerRef.current = null;
+    }
+    if (autoProxyTimerRef.current) {
+      clearTimeout(autoProxyTimerRef.current);
+      autoProxyTimerRef.current = null;
     }
   }, []);
 
@@ -127,6 +165,21 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
     }
     setAutoSkipCountdown(null);
   }, []);
+
+  // Helper to mark playback successfully started (active working stream found!)
+  const handleStreamSuccess = useCallback(() => {
+    clearWatchdogs();
+    clearAutoSkipTimer();
+    setIsLoading(false);
+    setHasError(false);
+    setConsecutiveSkippedCount((prev) => {
+      if (prev > 0) {
+        setShowRecoveredToast(true);
+        setTimeout(() => setShowRecoveredToast(false), 4500);
+      }
+      return 0;
+    });
+  }, [clearWatchdogs, clearAutoSkipTimer]);
 
   // Stop and clean up HLS and video element
   const cleanupMedia = useCallback(() => {
@@ -164,13 +217,14 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
       setErrorType(type);
       setErrorMessage(message);
 
-      if (channel) {
-        onChannelError?.(channel, type);
+      const ch = channelRef.current;
+      if (ch) {
+        onChannelErrorRef.current?.(ch, type);
       }
 
       // If auto-skip is enabled and not already at the bottom of the list:
-      if (autoSkipOnError && onNextChannel) {
-        if (isLastChannel) {
+      if (autoSkipOnErrorRef.current && onNextChannelRef.current) {
+        if (isLastChannelRef.current) {
           // Reached the bottom of the current list: halt auto-skipping
           clearAutoSkipTimer();
         } else {
@@ -182,7 +236,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
         clearAutoSkipTimer();
       }
     },
-    [channel, onChannelError, autoSkipOnError, onNextChannel, isLastChannel, clearWatchdogs, cleanupMedia, clearAutoSkipTimer]
+    [clearWatchdogs, cleanupMedia, clearAutoSkipTimer]
   );
 
   // Auto-skip countdown ticker: when countdown reaches 0, trigger onNextChannel(true)
@@ -197,8 +251,8 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
 
     if (autoSkipCountdown <= 0) {
       setAutoSkipCountdown(null);
-      if (!isLastChannel) {
-        onNextChannel?.(true); // isAutoSkip = true
+      if (!isLastChannelRef.current) {
+        onNextChannelRef.current?.(true); // isAutoSkip = true
       }
       return;
     }
@@ -212,7 +266,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
         clearTimeout(autoSkipTimerRef.current);
       }
     };
-  }, [autoSkipCountdown, onNextChannel, isLastChannel]);
+  }, [autoSkipCountdown]);
 
   // If user disables auto-skip while counting down, cancel immediately
   useEffect(() => {
@@ -230,15 +284,16 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
   const handleSkipNow = (e?: React.MouseEvent) => {
     if (e) e.stopPropagation();
     clearAutoSkipTimer();
-    if (!isLastChannel) {
-      onNextChannel?.(true);
+    if (!isLastChannelRef.current) {
+      onNextChannelRef.current?.(true);
     }
   };
 
   // Load and play stream with watchdog protection
   const startPlayback = useCallback(
     (proxyMode: boolean) => {
-      if (!channel) return;
+      const ch = channelRef.current;
+      if (!ch) return;
       cleanupMedia();
       clearAutoSkipTimer();
       setIsGatewayMode(false);
@@ -255,18 +310,25 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
       networkRetryCountRef.current = 0;
       mediaRetryCountRef.current = 0;
 
-      const rawUrl = channel.stream_url.trim();
+      const rawUrl = ch.stream_url.trim();
       const effectiveSource = getStreamSource(rawUrl, proxyMode);
       const isHls =
-        channel.format === 'hls' ||
+        ch.format === 'hls' ||
         rawUrl.includes('.m3u8') ||
         effectiveSource.includes('.m3u8');
 
       const video = videoRef.current;
-      if (!video) return;
+      if (!video) {
+        setTimeout(() => {
+          if (videoRef.current) {
+            startPlayback(proxyMode);
+          }
+        }, 50);
+        return;
+      }
 
       // -------------------------------------------------------------
-      // 1. WATCHDOG TIMER: Maximum 8 seconds per stream attempt
+      // 1. WATCHDOG TIMER: Maximum 8.5 seconds per stream attempt
       // -------------------------------------------------------------
       loadingTickerRef.current = setInterval(() => {
         setLoadingSeconds((prev) => {
@@ -281,9 +343,8 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
       }, 1000);
 
       // Auto-switch to proxy at 3.5s if direct mode hasn't received data
-      let autoProxyTimer: NodeJS.Timeout | null = null;
       if (!proxyMode) {
-        autoProxyTimer = setTimeout(() => {
+        autoProxyTimerRef.current = setTimeout(() => {
           if (!videoRef.current?.paused && videoRef.current?.currentTime && videoRef.current.currentTime > 0) {
             return;
           }
@@ -295,31 +356,23 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
         }, 3500);
       }
 
-      // Hard timeout after 8 seconds: Mark channel dead/offline
+      // Hard timeout after 8.5 seconds: Mark channel dead/offline or switch to proxy
       watchdogTimerRef.current = setTimeout(() => {
-        if (autoProxyTimer) clearTimeout(autoProxyTimer);
-        console.warn(`[Watchdog Timeout] Stream not responding after 8s for channel: ${channel.name}`);
-        triggerErrorState(
-          'TIMEOUT',
-          'Thời gian kết nối vượt quá 8 giây. Máy chủ nguồn IPTV này hiện đang ngoại tuyến, băng thông bị nghẽn hoặc chặn IP.'
-        );
-      }, 8000);
-
-      // Helper to mark playback successfully started (active working stream found!)
-      const onStreamSuccess = () => {
-        if (autoProxyTimer) clearTimeout(autoProxyTimer);
-        clearWatchdogs();
-        clearAutoSkipTimer();
-        setIsLoading(false);
-        setHasError(false);
-        setConsecutiveSkippedCount((prev) => {
-          if (prev > 0) {
-            setShowRecoveredToast(true);
-            setTimeout(() => setShowRecoveredToast(false), 4500);
-          }
-          return 0;
-        });
-      };
+        if (autoProxyTimerRef.current) clearTimeout(autoProxyTimerRef.current);
+        console.warn(`[Watchdog Timeout] Stream not responding after 8.5s for channel: ${ch.name}`);
+        if (!proxyMode) {
+          console.info('[Watchdog Fallback] Direct stream timed out, auto-trying Proxy mode...');
+          clearWatchdogs();
+          cleanupMedia();
+          setUseProxy(true);
+          startPlayback(true);
+        } else {
+          triggerErrorState(
+            'TIMEOUT',
+            'Thời gian kết nối vượt quá 8.5 giây. Máy chủ nguồn IPTV này hiện đang ngoại tuyến, băng thông bị nghẽn hoặc chặn IP.'
+          );
+        }
+      }, 8500);
 
       // -------------------------------------------------------------
       // 2. PRIMARY ENGINE: HLS.js with MediaSource Extensions
@@ -356,7 +409,9 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
         hls.attachMedia(video);
 
         hls.on(Hls.Events.MANIFEST_PARSED, () => {
-          onStreamSuccess();
+          // Manifest is parsed: begin requesting fragments & attempt playback.
+          // Note: DO NOT clear watchdogs here; wait until frames are actually playing!
+          setLoadingMessage('Đang nạp phân đoạn dữ liệu & giải mã video...');
           video
             .play()
             .then(() => {
@@ -373,8 +428,12 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
                   setIsPlaying(true);
                   setAutoplayMuted(true);
                 })
-                .catch(() => {
+                .catch((playErr) => {
+                  console.warn('Autoplay fully blocked or unsupported:', playErr);
                   setIsPlaying(false);
+                  if (video.error) {
+                    triggerErrorState('DECODE', 'Trình duyệt không thể giải mã luồng video này.');
+                  }
                 });
             });
         });
@@ -382,11 +441,28 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
         hls.on(Hls.Events.FRAG_LOADED, () => {
           networkRetryCountRef.current = 0;
           mediaRetryCountRef.current = 0;
-          onStreamSuccess();
+          if (video.currentTime > 0) {
+            handleStreamSuccess();
+          } else {
+            setLoadingMessage('Đang giải mã phân đoạn video đầu tiên...');
+          }
         });
 
         hls.on(Hls.Events.ERROR, (_event, data) => {
           if (!data.fatal) {
+            if (data.details === Hls.ErrorDetails.BUFFER_STALLED_ERROR) {
+              console.warn('[HLS Buffer Stalled] Buffer starved, attempting recovery...');
+              mediaRetryCountRef.current += 1;
+              if (mediaRetryCountRef.current <= 2) {
+                hls.recoverMediaError();
+              } else if (!proxyMode) {
+                clearWatchdogs();
+                cleanupMedia();
+                console.info('[HLS Fallback] Stalled stream auto-switching to Proxy CORS...');
+                setUseProxy(true);
+                setTimeout(() => startPlayback(true), 100);
+              }
+            }
             return;
           }
 
@@ -395,14 +471,12 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
           switch (data.type) {
             case Hls.ErrorTypes.NETWORK_ERROR:
               if (!proxyMode) {
-                if (autoProxyTimer) clearTimeout(autoProxyTimer);
                 clearWatchdogs();
                 cleanupMedia();
                 console.info('[HLS Fallback] Direct stream failed with network error, auto-switching to Proxy CORS...');
                 setUseProxy(true);
                 setTimeout(() => startPlayback(true), 100);
               } else {
-                if (autoProxyTimer) clearTimeout(autoProxyTimer);
                 triggerErrorState('OFFLINE', 'Máy chủ IPTV từ chối kết nối hoặc đã ngừng phát sóng.');
               }
               break;
@@ -414,13 +488,11 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
                 hls.recoverMediaError();
               } else {
                 mediaRetryCountRef.current = 0;
-                if (autoProxyTimer) clearTimeout(autoProxyTimer);
                 triggerErrorState('DECODE', 'Định dạng video/audio này không hỗ trợ giải mã trực tiếp trên trình duyệt web.');
               }
               break;
 
             default:
-              if (autoProxyTimer) clearTimeout(autoProxyTimer);
               triggerErrorState('DECODE', 'Định dạng luồng phát không tương thích với trình duyệt hiện tại.');
               break;
           }
@@ -436,7 +508,6 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
         video
           .play()
           .then(() => {
-            onStreamSuccess();
             setIsPlaying(true);
             setAutoplayMuted(false);
           })
@@ -447,7 +518,6 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
             video
               .play()
               .then(() => {
-                onStreamSuccess();
                 setIsPlaying(true);
                 setAutoplayMuted(true);
               })
@@ -471,7 +541,6 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
       video
         .play()
         .then(() => {
-          onStreamSuccess();
           setIsPlaying(true);
         })
         .catch(() => {
@@ -484,18 +553,37 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
           }
         });
     },
-    [channel, getStreamSource, cleanupMedia, clearWatchdogs, clearAutoSkipTimer, triggerErrorState]
+    [getStreamSource, cleanupMedia, clearWatchdogs, clearAutoSkipTimer, triggerErrorState]
   );
+
+  // Handle buffering / stall during active playback
+  const handleVideoBuffering = useCallback(() => {
+    if (stallTimerRef.current) clearTimeout(stallTimerRef.current);
+    // If stalled for more than 7s without advancing frames
+    stallTimerRef.current = setTimeout(() => {
+      const v = videoRef.current;
+      if (v && !v.paused && v.readyState < 3) {
+        console.warn('[Stall Watchdog] Stream buffering stalled for >7s');
+        if (!useProxy && channelRef.current) {
+          console.info('Auto-switching to proxy due to prolonged stall...');
+          clearWatchdogs();
+          cleanupMedia();
+          setUseProxy(true);
+          setTimeout(() => startPlayback(true), 50);
+        } else {
+          triggerErrorState('TIMEOUT', 'Đường truyền máy chủ IPTV bị gián đoạn, mất tín hiệu hoặc nghẽn băng thông.');
+        }
+      }
+    }, 7000);
+  }, [useProxy, clearWatchdogs, cleanupMedia, startPlayback, triggerErrorState]);
 
   // Catch unhandled native video element errors
   const handleVideoError = (e: React.SyntheticEvent<HTMLVideoElement, Event>) => {
-    if (hlsRef.current) {
-      return;
-    }
+    const mediaError = videoRef.current?.error;
+    if (!mediaError) return;
 
     e.preventDefault();
     e.stopPropagation();
-    const mediaError = videoRef.current?.error;
     console.warn('Caught video element error:', mediaError?.code, mediaError?.message);
 
     clearWatchdogs();
@@ -512,7 +600,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
       return;
     }
 
-    if (!useProxy && channel) {
+    if (!useProxy && channelRef.current) {
       console.info('Auto-switching to proxy mode after video element error...');
       setUseProxy(true);
       setTimeout(() => {
@@ -527,9 +615,32 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
     );
   };
 
-  // Trigger playback on channel change or playTrigger
+  // Trigger playback ONLY when the channel ID, channel stream URL, or explicit playTrigger changes!
   useEffect(() => {
-    if (!channel) return;
+    if (!channel) {
+      currentStreamIdRef.current = null;
+      currentStreamUrlRef.current = null;
+      cleanupMedia();
+      clearAutoSkipTimer();
+      return;
+    }
+
+    // Guard: If this exact channel and stream URL are already playing and playTrigger hasn't changed,
+    // NEVER restart or clean up media! This guarantees buttery smooth playback with zero stutter
+    // when typing in search, paging, or clicking unrelated UI elements.
+    const isSameChannelAndUrl =
+      currentStreamIdRef.current === channel.id &&
+      currentStreamUrlRef.current === channel.stream_url &&
+      currentPlayTriggerRef.current === playTrigger;
+
+    if (isSameChannelAndUrl) {
+      return;
+    }
+
+    currentStreamIdRef.current = channel.id;
+    currentStreamUrlRef.current = channel.stream_url;
+    currentPlayTriggerRef.current = playTrigger;
+
     cleanupMedia();
     clearAutoSkipTimer();
     setHasError(false);
@@ -550,7 +661,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
       cleanupMedia();
       clearAutoSkipTimer();
     };
-  }, [channel, playTrigger, cleanupMedia, clearAutoSkipTimer, startPlayback]);
+  }, [channel?.id, channel?.stream_url, playTrigger, cleanupMedia, clearAutoSkipTimer, startPlayback]);
 
   // Synchronize audio muted / volume state with native video element
   const syncAudioState = useCallback(() => {
@@ -803,126 +914,142 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
     <div className="w-full bg-neutral-900 border border-neutral-800 rounded-xl overflow-hidden shadow-2xl flex flex-col">
       {/* Video Canvas Container */}
       <div className="relative w-full aspect-video bg-black flex items-center justify-center group overflow-hidden">
-        {!hasError ? (
-          <>
-            <video
-              ref={videoRef}
-              className="w-full h-full object-contain cursor-pointer"
-              playsInline
-              controls
-              onClick={handleVideoClick}
-              onPlay={() => {
-                setIsPlaying(true);
-                syncAudioState();
-              }}
-              onPause={() => setIsPlaying(false)}
-              onVolumeChange={syncAudioState}
-              onLoadedMetadata={syncAudioState}
-              onError={handleVideoError}
-            />
+        {/* HTML5 Video Element - ALWAYS MOUNTED to guarantee persistent ref and prevent null ref race conditions */}
+        <video
+          ref={videoRef}
+          className="w-full h-full object-contain cursor-pointer"
+          playsInline
+          controls
+          onClick={handleVideoClick}
+          onPlay={() => {
+            setIsPlaying(true);
+            syncAudioState();
+          }}
+          onPlaying={() => {
+            // Real media frames have begun rendering!
+            if (videoRef.current && (videoRef.current.currentTime > 0 || videoRef.current.readyState >= 2)) {
+              handleStreamSuccess();
+            }
+            setIsPlaying(true);
+            syncAudioState();
+          }}
+          onTimeUpdate={() => {
+            if (videoRef.current && videoRef.current.currentTime > 0 && isLoading) {
+              handleStreamSuccess();
+            }
+          }}
+          onWaiting={handleVideoBuffering}
+          onStalled={handleVideoBuffering}
+          onPause={() => setIsPlaying(false)}
+          onVolumeChange={syncAudioState}
+          onLoadedMetadata={syncAudioState}
+          onError={handleVideoError}
+        />
 
-            {/* Top Gateway Transcode Active Badge */}
-            {isGatewayMode && (
-              <div className="absolute top-3 left-3 z-20 px-2.5 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 border shadow-lg backdrop-blur-md bg-blue-950/85 text-blue-200 border-blue-600/80 animate-fadeIn">
-                <Zap className="w-3.5 h-3.5 text-amber-300 animate-pulse" />
-                <span>Gateway MP4 (H.264 / AAC)</span>
-              </div>
+        {/* Top Gateway Transcode Active Badge */}
+        {isGatewayMode && !hasError && (
+          <div className="absolute top-3 left-3 z-20 px-2.5 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 border shadow-lg backdrop-blur-md bg-blue-950/85 text-blue-200 border-blue-600/80 animate-fadeIn">
+            <Zap className="w-3.5 h-3.5 text-amber-300 animate-pulse" />
+            <span>Gateway MP4 (H.264 / AAC)</span>
+          </div>
+        )}
+
+        {/* Top Sound Control */}
+        {!hasError && (
+          <button
+            type="button"
+            onClick={handleToggleMute}
+            className={`absolute top-3 right-3 z-20 px-2.5 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 border shadow-lg backdrop-blur-md transition cursor-pointer ${
+              isMuted
+                ? 'bg-rose-950/85 text-rose-300 border-rose-700/80 hover:bg-rose-900/90'
+                : 'bg-emerald-950/85 text-emerald-300 border-emerald-700/80 hover:bg-emerald-900/90'
+            }`}
+            title={isMuted ? 'Bật âm thanh (Unmute)' : 'Tắt tiếng (Mute)'}
+          >
+            {isMuted ? (
+              <VolumeX className="w-4 h-4 text-rose-400" />
+            ) : (
+              <Volume2 className="w-4 h-4 text-emerald-400" />
             )}
+            <span className="text-[11px] font-bold">
+              {isMuted ? 'Tắt tiếng' : 'Bật tiếng'}
+            </span>
+          </button>
+        )}
 
-            {/* Top Sound Control */}
-            <button
-              type="button"
-              onClick={handleToggleMute}
-              className={`absolute top-3 right-3 z-20 px-2.5 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 border shadow-lg backdrop-blur-md transition cursor-pointer ${
-                isMuted
-                  ? 'bg-rose-950/85 text-rose-300 border-rose-700/80 hover:bg-rose-900/90'
-                  : 'bg-emerald-950/85 text-emerald-300 border-emerald-700/80 hover:bg-emerald-900/90'
-              }`}
-              title={isMuted ? 'Bật âm thanh (Unmute)' : 'Tắt tiếng (Mute)'}
-            >
-              {isMuted ? (
-                <VolumeX className="w-4 h-4 text-rose-400" />
-              ) : (
-                <Volume2 className="w-4 h-4 text-emerald-400" />
-              )}
-              <span className="text-[11px] font-bold">
-                {isMuted ? 'Tắt tiếng' : 'Bật tiếng'}
+        {/* Autoplay / Muted Notice */}
+        {isPlaying && isMuted && !hasError && (
+          <button
+            type="button"
+            onClick={handleUnmuteAudio}
+            className="absolute top-3 left-1/2 -translate-x-1/2 z-20 bg-amber-500 hover:bg-amber-400 text-neutral-950 px-3.5 py-1.5 rounded-full font-bold text-xs flex items-center gap-1.5 shadow-lg cursor-pointer transition animate-bounce border border-amber-300"
+            title="Nhấn để bật âm thanh"
+          >
+            <VolumeX className="w-4 h-4" />
+            <span>Đang tắt tiếng. Bấm vào đây để BẬT TIẾNG!</span>
+          </button>
+        )}
+
+        {/* Auto-Seek Recovery Success Toast */}
+        {showRecoveredToast && !hasError && (
+          <div className="absolute top-12 left-1/2 -translate-x-1/2 z-20 bg-emerald-500 text-neutral-950 font-bold px-4 py-1.5 rounded-full text-xs flex items-center gap-1.5 shadow-xl border border-emerald-300 animate-fadeIn">
+            <CheckCircle2 className="w-4 h-4 text-neutral-950" />
+            <span>Đã tìm thấy kênh hoạt động: {channel?.name}!</span>
+          </div>
+        )}
+
+        {/* Big Center Play Button Overlay */}
+        {!isPlaying && !isLoading && !hasError && (
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              handleTogglePlay(e);
+            }}
+            className="absolute z-10 w-16 h-16 rounded-full bg-amber-500 hover:bg-amber-400 text-neutral-950 flex items-center justify-center shadow-2xl shadow-amber-500/50 hover:scale-110 active:scale-95 transition-all cursor-pointer"
+            title="Bấm để phát (Play)"
+          >
+            <Play className="w-8 h-8 fill-current ml-1" />
+          </button>
+        )}
+
+        {/* Smart Loading Overlay with Dynamic Multi-Stage Status & Skip Button */}
+        {isLoading && !hasError && (
+          <div className="absolute inset-0 bg-black/85 backdrop-blur-xs flex flex-col items-center justify-center z-10 p-6 text-center animate-fadeIn">
+            <div className="relative mb-3 flex items-center justify-center">
+              <div className="w-12 h-12 rounded-full border-2 border-amber-500/20 border-t-amber-400 animate-spin" />
+              <span className="absolute text-[11px] font-bold text-amber-400">
+                {loadingSeconds}s
               </span>
-            </button>
+            </div>
+            <p className="text-xs font-bold text-neutral-200 tracking-wide max-w-sm leading-relaxed">
+              {loadingMessage}
+            </p>
+            <p className="text-[10px] text-neutral-400 mt-1">
+              Đang giám sát luồng phát • Giới hạn chờ tối đa 8.5 giây
+            </p>
 
-            {/* Autoplay / Muted Notice */}
-            {isPlaying && isMuted && (
-              <button
-                type="button"
-                onClick={handleUnmuteAudio}
-                className="absolute top-3 left-1/2 -translate-x-1/2 z-20 bg-amber-500 hover:bg-amber-400 text-neutral-950 px-3.5 py-1.5 rounded-full font-bold text-xs flex items-center gap-1.5 shadow-lg cursor-pointer transition animate-bounce border border-amber-300"
-                title="Nhấn để bật âm thanh"
-              >
-                <VolumeX className="w-4 h-4" />
-                <span>Đang tắt tiếng. Bấm vào đây để BẬT TIẾNG!</span>
-              </button>
-            )}
-
-            {/* Auto-Seek Recovery Success Toast */}
-            {showRecoveredToast && (
-              <div className="absolute top-12 left-1/2 -translate-x-1/2 z-20 bg-emerald-500 text-neutral-950 font-bold px-4 py-1.5 rounded-full text-xs flex items-center gap-1.5 shadow-xl border border-emerald-300 animate-fadeIn">
-                <CheckCircle2 className="w-4 h-4 text-neutral-950" />
-                <span>Đã tìm thấy kênh hoạt động: {channel?.name}!</span>
-              </div>
-            )}
-
-            {/* Big Center Play Button Overlay */}
-            {!isPlaying && !isLoading && (
+            {/* Instant Skip button during loading */}
+            {onNextChannel && !isLastChannel && (
               <button
                 type="button"
                 onClick={(e) => {
                   e.stopPropagation();
-                  handleTogglePlay(e);
+                  onNextChannel(false);
                 }}
-                className="absolute z-10 w-16 h-16 rounded-full bg-amber-500 hover:bg-amber-400 text-neutral-950 flex items-center justify-center shadow-2xl shadow-amber-500/50 hover:scale-110 active:scale-95 transition-all cursor-pointer"
-                title="Bấm để phát (Play)"
+                className="mt-3.5 px-3 py-1.5 bg-neutral-800/90 hover:bg-neutral-700 text-neutral-300 hover:text-white rounded-lg text-xs font-medium flex items-center gap-1.5 border border-neutral-700 shadow-md transition pointer-events-auto cursor-pointer"
+                title="Bỏ qua kênh này để chuyển kênh kế tiếp ngay"
               >
-                <Play className="w-8 h-8 fill-current ml-1" />
+                <SkipForward className="w-3.5 h-3.5 text-amber-400" />
+                <span>Bỏ qua sang kênh kế tiếp</span>
               </button>
             )}
+          </div>
+        )}
 
-            {/* Smart Loading Overlay with Dynamic Multi-Stage Status & Skip Button */}
-            {isLoading && (
-              <div className="absolute inset-0 bg-black/85 backdrop-blur-xs flex flex-col items-center justify-center z-10 p-6 text-center animate-fadeIn">
-                <div className="relative mb-3 flex items-center justify-center">
-                  <div className="w-12 h-12 rounded-full border-2 border-amber-500/20 border-t-amber-400 animate-spin" />
-                  <span className="absolute text-[11px] font-bold text-amber-400">
-                    {loadingSeconds}s
-                  </span>
-                </div>
-                <p className="text-xs font-bold text-neutral-200 tracking-wide max-w-sm leading-relaxed">
-                  {loadingMessage}
-                </p>
-                <p className="text-[10px] text-neutral-400 mt-1">
-                  Đang giám sát luồng phát • Giới hạn chờ tối đa 8 giây
-                </p>
-
-                {/* Instant Skip button during loading */}
-                {onNextChannel && !isLastChannel && (
-                  <button
-                    type="button"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      onNextChannel(false);
-                    }}
-                    className="mt-3.5 px-3 py-1.5 bg-neutral-800/90 hover:bg-neutral-700 text-neutral-300 hover:text-white rounded-lg text-xs font-medium flex items-center gap-1.5 border border-neutral-700 shadow-md transition pointer-events-auto cursor-pointer"
-                    title="Bỏ qua kênh này để chuyển kênh kế tiếp ngay"
-                  >
-                    <SkipForward className="w-3.5 h-3.5 text-amber-400" />
-                    <span>Bỏ qua sang kênh kế tiếp</span>
-                  </button>
-                )}
-              </div>
-            )}
-          </>
-        ) : (
-          /* Rich Diagnostic Error Fallback Banner */
-          <div className="absolute inset-0 bg-neutral-950/95 flex flex-col items-center justify-center p-6 text-center z-20 overflow-y-auto animate-fadeIn">
+        {/* Rich Diagnostic Error Fallback Banner Overlay */}
+        {hasError && (
+          <div className="absolute inset-0 bg-neutral-950/95 flex flex-col items-center justify-center p-6 text-center z-30 overflow-y-auto animate-fadeIn">
             <div className="w-12 h-12 rounded-full bg-rose-500/10 border border-rose-500/30 flex items-center justify-center text-rose-500 mb-2 shadow-lg shadow-rose-950/50">
               {errorType === 'TIMEOUT' ? (
                 <WifiOff className="w-6 h-6 animate-pulse" />
@@ -934,7 +1061,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
             <div className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-rose-950/70 border border-rose-700/50 text-rose-300 text-[10px] font-bold uppercase tracking-wider mb-1.5">
               <span>
                 {errorType === 'TIMEOUT'
-                  ? 'Quá thời gian phản hồi (Hết 8s)'
+                  ? 'Quá thời gian phản hồi (Hết 8.5s)'
                   : errorType === 'OFFLINE'
                   ? 'Máy chủ ngoại tuyến / Chặn kết nối'
                   : 'Không hỗ trợ định dạng'}
@@ -1119,16 +1246,16 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
                 {copied ? 'Đã sao chép!' : 'Copy URL'}
               </button>
 
-              {/* Open in CorePlayer / VLC external link */}
+              {/* Open in external tab / VLC external link */}
               <a
                 href={`/open/${channel.id}`}
                 target="_blank"
                 rel="noopener noreferrer"
                 className="px-2.5 py-2 bg-rose-950/60 hover:bg-rose-900 text-rose-200 border border-rose-800/60 rounded-lg text-xs font-medium flex items-center gap-1 transition"
-                title="Mở tab mới hoặc ứng dụng ngoài (CorePlayer/VLC)"
+                title="Mở kênh trên tab trình duyệt mới hoặc ứng dụng ngoài"
               >
                 <ExternalLink className="w-3.5 h-3.5 text-rose-300" />
-                Mở CorePlayer / VLC
+                Mở tab mới
               </a>
             </div>
           </div>
@@ -1335,4 +1462,4 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
       </div>
     </div>
   );
-};
+});

@@ -16,7 +16,7 @@ interface ChannelTrafficChartProps {
   className?: string;
 }
 
-export const ChannelTrafficChart: React.FC<ChannelTrafficChartProps> = ({ className = '' }) => {
+export const ChannelTrafficChart: React.FC<ChannelTrafficChartProps> = React.memo(({ className = '' }) => {
   const [stats, setStats] = useState<ChannelTrafficStats | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
   const [refreshing, setRefreshing] = useState<boolean>(false);
@@ -272,4 +272,4 @@ export const ChannelTrafficChart: React.FC<ChannelTrafficChartProps> = ({ classN
       )}
     </div>
   );
-};
+});

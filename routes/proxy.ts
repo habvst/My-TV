@@ -107,10 +107,36 @@ function handleProxyStream(req: Request, res: Response, targetUrl: string, isRet
         parsedUrl.search.includes('.m3u8');
 
       if (isM3u8 && req.method !== 'HEAD') {
-        // Read manifest into buffer and rewrite segment links
+        // Read manifest into buffer and rewrite segment links with timeout protection
         const chunks: Buffer[] = [];
-        remoteRes.on('data', (chunk) => chunks.push(chunk));
+        let manifestTimeout: NodeJS.Timeout | null = setTimeout(() => {
+          if (!remoteRes.destroyed) remoteRes.destroy();
+          if (!res.headersSent) {
+            res.status(504).json({
+              error: 'manifest_timeout',
+              message: 'Máy chủ phản hồi danh sách phát M3U8 quá chậm (hết 7s)',
+              url: targetUrl,
+            });
+          }
+        }, 7000);
+
+        remoteRes.on('data', (chunk) => {
+          chunks.push(chunk);
+          // Safety guard: manifest files shouldn't exceed 3MB
+          if (chunks.reduce((acc, c) => acc + c.length, 0) > 3 * 1024 * 1024) {
+            if (manifestTimeout) clearTimeout(manifestTimeout);
+            remoteRes.destroy();
+            if (!res.headersSent) {
+              res.status(502).json({ error: 'manifest_too_large', message: 'Tệp M3U8 vượt quá kích thước cho phép' });
+            }
+          }
+        });
+
         remoteRes.on('end', () => {
+          if (manifestTimeout) {
+            clearTimeout(manifestTimeout);
+            manifestTimeout = null;
+          }
           let buffer = Buffer.concat(chunks);
           const encoding = (remoteRes.headers['content-encoding'] || '').toLowerCase();
           const isGzip = encoding === 'gzip' || (buffer.length > 2 && buffer[0] === 0x1f && buffer[1] === 0x8b);

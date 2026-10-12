@@ -660,6 +660,100 @@ export async function deleteChannel(id: string): Promise<boolean> {
   }
 }
 
+export async function batchUpdateChannelsStatus(
+  updates: Array<{ id: string; status: 'active' | 'offline' | 'check' }>
+): Promise<number> {
+  if (!updates || updates.length === 0) return 0;
+  const updateMap = new Map<string, 'active' | 'offline' | 'check'>();
+  for (const u of updates) {
+    updateMap.set(u.id, u.status);
+  }
+
+  const now = new Date().toISOString();
+  let updatedCount = 0;
+
+  if (pool) {
+    try {
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        for (const [id, status] of updateMap.entries()) {
+          const res = await client.query(
+            'UPDATE channels SET status = $1, updated_at = $2 WHERE id = $3',
+            [status, now, id]
+          );
+          updatedCount += res.rowCount || 0;
+        }
+        await client.query('COMMIT');
+      } catch (e) {
+        await client.query('ROLLBACK');
+        throw e;
+      } finally {
+        client.release();
+      }
+    } catch (err) {
+      console.error('[Storage] Postgres batchUpdateChannelsStatus error:', err);
+    }
+  } else {
+    for (const ch of channelsCache) {
+      const newStatus = updateMap.get(ch.id);
+      if (newStatus && ch.status !== newStatus) {
+        ch.status = newStatus;
+        ch.updated_at = now;
+        updatedCount++;
+      }
+    }
+    if (updatedCount > 0) {
+      saveFileState();
+    }
+  }
+
+  return updatedCount;
+}
+
+export async function resetChannelsStatus(
+  status: 'active' | 'offline' | 'check' = 'active',
+  playlistId?: string
+): Promise<number> {
+  const now = new Date().toISOString();
+  let updatedCount = 0;
+
+  if (pool) {
+    try {
+      let res;
+      if (playlistId && playlistId !== 'all') {
+        res = await pool.query(
+          'UPDATE channels SET status = $1, updated_at = $2 WHERE playlist_id = $3',
+          [status, now, playlistId]
+        );
+      } else {
+        res = await pool.query(
+          'UPDATE channels SET status = $1, updated_at = $2',
+          [status, now]
+        );
+      }
+      updatedCount = res.rowCount || 0;
+    } catch (err) {
+      console.error('[Storage] Postgres resetChannelsStatus error:', err);
+    }
+  } else {
+    for (const ch of channelsCache) {
+      if (!playlistId || playlistId === 'all' || ch.playlist_id === playlistId) {
+        if (ch.status !== status) {
+          ch.status = status;
+          ch.updated_at = now;
+          updatedCount++;
+        }
+      }
+    }
+    if (updatedCount > 0) {
+      saveFileState();
+    }
+  }
+
+  return updatedCount;
+}
+
 // -----------------------------------------------------------------------------
 // PLAYLIST SYNC / REFRESH ENGINE
 // -----------------------------------------------------------------------------

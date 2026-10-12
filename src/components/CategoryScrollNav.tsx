@@ -11,7 +11,7 @@ interface CategoryScrollNavProps {
   recentCount: number;
 }
 
-export const CategoryScrollNav: React.FC<CategoryScrollNavProps> = ({
+export const CategoryScrollNav: React.FC<CategoryScrollNavProps> = React.memo(({
   categories,
   groupCounts,
   activeGroup,
@@ -255,4 +255,4 @@ export const CategoryScrollNav: React.FC<CategoryScrollNavProps> = ({
       </div>
     </div>
   );
-};
+});

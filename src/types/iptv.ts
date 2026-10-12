@@ -43,6 +43,17 @@ export interface StreamTestResult {
   message: string;
 }
 
+export interface ChannelScanResult {
+  id: string;
+  name: string;
+  group: string;
+  stream_url: string;
+  status: 'online' | 'warning' | 'offline';
+  http_status?: number;
+  message: string;
+  response_time_ms: number;
+}
+
 export type DeviceType = 'NOKIA_S60' | 'MOBILE_MODERN' | 'TABLET' | 'DESKTOP' | 'UNKNOWN';
 
 export interface DeviceInfo {

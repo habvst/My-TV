@@ -13,7 +13,7 @@ interface ChannelCardProps {
   onOpenDetails: (channel: Channel, e: React.MouseEvent) => void;
 }
 
-export const ChannelCard: React.FC<ChannelCardProps> = ({
+export const ChannelCard: React.FC<ChannelCardProps> = React.memo(({
   channel,
   isActive,
   isFavorite,
@@ -78,13 +78,13 @@ export const ChannelCard: React.FC<ChannelCardProps> = ({
                 Đang phát
               </span>
             )}
-            {isBroken && !isActive && (
+            {(isBroken || channel.status === 'offline') && !isActive && (
               <span
                 className="text-[10px] font-bold text-rose-400 bg-rose-500/15 border border-rose-500/30 px-1.5 py-0.5 rounded flex items-center gap-0.5"
-                title="Kênh này hiện đang phản hồi chậm hoặc tạm gián đoạn nguồn"
+                title="Kênh này đang bị lỗi tín hiệu hoặc máy chủ nguồn ngừng phát"
               >
                 <AlertCircle className="w-2.5 h-2.5 text-rose-400" />
-                Gián đoạn
+                Lỗi nguồn
               </span>
             )}
           </div>
@@ -150,7 +150,7 @@ export const ChannelCard: React.FC<ChannelCardProps> = ({
       </div>
     </div>
   );
-};
+});
 
 export const ChannelCardSkeleton: React.FC = () => {
   return (

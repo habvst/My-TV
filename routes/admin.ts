@@ -20,6 +20,8 @@ import {
   updateChannel,
   deleteChannel,
   testStreamUrl,
+  batchUpdateChannelsStatus,
+  resetChannelsStatus,
 } from '../src/db/storage.js';
 
 const router = Router();
@@ -258,6 +260,107 @@ router.post('/api/admin/test-stream', async (req: Request, res: Response) => {
     }
     const result = await testStreamUrl(url.trim());
     res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// -----------------------------------------------------------------------------
+// BATCH CHANNEL HEALTH SCANNER & AUTO-MARK
+// -----------------------------------------------------------------------------
+
+router.post('/api/admin/channels/scan-batch', async (req: Request, res: Response) => {
+  try {
+    const { channelIds, updateStatus = true } = req.body;
+    if (!Array.isArray(channelIds) || channelIds.length === 0) {
+      return res.status(400).json({ error: 'Danh sách channelIds không hợp lệ.' });
+    }
+
+    // Limit batch size to protect resources (max 50 per batch request)
+    const targetIds = channelIds.slice(0, 50);
+    const channels = await getAllChannelsAdmin();
+    const channelMap = new Map(channels.map((c) => [c.id, c]));
+
+    const results: Array<{
+      id: string;
+      name: string;
+      group: string;
+      stream_url: string;
+      status: 'online' | 'warning' | 'offline';
+      http_status?: number;
+      message: string;
+      response_time_ms: number;
+    }> = [];
+
+    const updates: Array<{ id: string; status: 'active' | 'offline' | 'check' }> = [];
+
+    // Controlled concurrency pool (5 simultaneous probes per batch)
+    const concurrency = 5;
+    for (let i = 0; i < targetIds.length; i += concurrency) {
+      const chunk = targetIds.slice(i, i + concurrency);
+      const chunkPromises = chunk.map(async (id) => {
+        const ch = channelMap.get(id);
+        if (!ch) {
+          return {
+            id,
+            name: 'Kênh không tồn tại',
+            group: '',
+            stream_url: '',
+            status: 'offline' as const,
+            message: 'Không tìm thấy kênh trong hệ thống',
+            response_time_ms: 0,
+          };
+        }
+
+        const testRes = await testStreamUrl(ch.stream_url);
+        return {
+          id: ch.id,
+          name: ch.name,
+          group: ch.group,
+          stream_url: ch.stream_url,
+          status: testRes.status,
+          http_status: testRes.http_status,
+          message: testRes.message,
+          response_time_ms: testRes.response_time_ms,
+        };
+      });
+
+      const chunkResults = await Promise.all(chunkPromises);
+      for (const r of chunkResults) {
+        results.push(r);
+        if (updateStatus) {
+          updates.push({
+            id: r.id,
+            status: r.status === 'offline' ? 'offline' : 'active',
+          });
+        }
+      }
+    }
+
+    let updatedCount = 0;
+    if (updateStatus && updates.length > 0) {
+      updatedCount = await batchUpdateChannelsStatus(updates);
+    }
+
+    res.json({
+      success: true,
+      results,
+      updatedCount,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post('/api/admin/channels/reset-status', async (req: Request, res: Response) => {
+  try {
+    const { playlist_id, status = 'active' } = req.body;
+    const count = await resetChannelsStatus(status, playlist_id);
+    res.json({
+      success: true,
+      message: `Đã khôi phục trạng thái ${status} cho ${count} kênh.`,
+      count,
+    });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
